@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+
+# -----------------------------------------------
+# Project-specific — DO NOT push these to GitHub
+# -----------------------------------------------
+
+# Trained model checkpoints (can be large)
+models/
+
+# Raw data files (keep on local machine / USB drive)
+data/
+
+# Inference output plots and arrays
+inference_output/
+
+# Diagnostic / scratch scripts
+diagnose_dat.py
+test_load.py
+
+# -----------------------------------------------
+# IDE / OS
+# -----------------------------------------------
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+Thumbs.db
+.DS_Store
+desktop.ini
