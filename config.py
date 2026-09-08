@@ -5,8 +5,29 @@ class Config:
     RANDOM_SEED: int = 42
     DETERMINISTIC: bool = False
 
-    SIGNAL_LENGTH: int = 14113        # samples per window (used by all datasets)
-    SAMPLE_RATE: float = 48_000.0
+    # ------------------------------------------------------------------ #
+    # Signal window length
+    # At 100 kHz:  25000 samples = 250 ms
+    #   → covers 100ms LFM pulse + 60ms reverb + 90ms margin on both sides
+    # NOTE: The pretrained U-Net is fully convolutional — changing this
+    # value does NOT invalidate pretrained weights. Fine-tuning adapts them.
+    # ------------------------------------------------------------------ #
+    SIGNAL_LENGTH: int = 25000
+    SAMPLE_RATE: float = 100_000.0    # Hz
+
+    # ------------------------------------------------------------------ #
+    # Active-region extraction  (signal_extractor + trial dataset)
+    # At 100 kHz:
+    #   EXTRACTION_RMS_WINDOW = 1000  →  10 ms smoothing window
+    #   EXTRACTION_PAD_SAMPLES = 5000 →  50 ms margin on each side
+    # Tune EXTRACTION_THRESHOLD_FACTOR if:
+    #   too high → signal edges get clipped, or nothing detected
+    #   too low  → noise spikes get included in the active region
+    # ------------------------------------------------------------------ #
+    EXTRACTION_RMS_WINDOW: int        = 1000
+    EXTRACTION_THRESHOLD_FACTOR: float = 2.0   # works for sine-wave LFM (RMS = amp/√2)
+    EXTRACTION_PAD_SAMPLES: int       = 5000   # 50 ms reverb margin
+    EXTRACTION_NOISE_PERCENTILE: float = 20.0
 
     SYNTHETIC_IS_COMPLEX: bool = False
     TRIAL_IS_COMPLEX: bool = False
@@ -16,8 +37,12 @@ class Config:
     SYNTHETIC_NOISY_SUBDIR: str = r"C:\Users\HARSHA\Documents\nstl\signal_generation\Synthetic_Data\noisy"
 
     TRIAL_DATA_DIR: str = os.path.join("data", "trial_data")
-    TRIAL_SIGNAL_SUBDIR: str = r"C:\Users\HARSHA\Documents\nstl\signal_generation\Project\Signal"
-    TRIAL_NOISE_SUBDIR: str = r"C:\Users\HARSHA\Documents\nstl\signal_generation\Project\Noise"
+    # _scan_pri_tree expects:  <SUBDIR>/PRI_XX/channelYYY.dat
+    # So point one level ABOVE PRI_TEST → scanner finds PRI_TEST as the PRI folder.
+    TRIAL_SIGNAL_SUBDIR: str = r"C:\Users\HARSHA\.gemini\antigravity\scratch\nstl_acoustic\data\trial_data\Signal"
+    # Noise folder doesn't exist for generated data → skipped with a warning (noise
+    # reference is extracted from inside each signal file automatically).
+    TRIAL_NOISE_SUBDIR: str  = r"C:\Users\HARSHA\.gemini\antigravity\scratch\nstl_acoustic\data\trial_data\Noise"
 
     DETECTOR_DATA_DIR: str = os.path.join("data", "detector")
 
@@ -65,7 +90,7 @@ class Config:
     FINETUNE_LR_PATIENCE: int = 5
     FINETUNE_LR_MIN: float = 1e-7
     FINETUNE_NOISE_LAMBDA: float = 1.0
-    NOISE_REF_WINDOW: int = 512
+    NOISE_REF_WINDOW: int = 2000   # 20 ms at 100 kHz
 
     DETECTOR_EPOCHS: int = 50
     DETECTOR_BATCH_SIZE: int = 16

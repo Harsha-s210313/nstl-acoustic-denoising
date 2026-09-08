@@ -28,6 +28,14 @@ import logging
 import sys
 import numpy as np
 
+# Import shared extraction functions from the project
+sys.path.insert(0, r"C:\Users\HARSHA\.gemini\antigravity\scratch\nstl_acoustic")
+from utils import (
+    load_dat_file,
+    compute_rms_envelope,
+    estimate_noise_floor,
+    detect_active_region,
+)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -41,30 +49,29 @@ log = logging.getLogger(__name__)
 # ================================================================== #
 
 # Path to the trial .dat file you want to process
-INPUT_FILE = r"C:\Users\HARSHA\Documents\nstl\signal_generation\lfm_noisy.dat"
+INPUT_FILE = r"C:\Users\HARSHA\Documents\nstl\signal_generation\Project\Signal\PRI_01\channel001.dat"
 
 # Where to save the zeroed-out signal and the plot
-OUTPUT_DIR = r"C:\Users\HARSHA\.gemini\antigravity\scratch\nstl_acoustic"
+OUTPUT_DIR = r"C:\Users\HARSHA\.gemini\antigravity\scratch\nstl_acoustic\inference_output"
 
 # --- Detection parameters ---
+# At 100 kHz, 400,000 samples = 4 seconds
 
-# Number of samples in the sliding RMS window.
-# Smaller = finer detection.  Larger = smoother, less sensitive to brief spikes.
-# Rule of thumb: ~0.5–2% of signal length.  For 32154 samples → 200–640.
-RMS_WINDOW = 300
+# Sliding RMS window (samples).
+# 1000 samples @ 100kHz = 10 ms — good for smoothing without blurring edges.
+RMS_WINDOW = 1000
 
 # How many times above the noise-floor RMS = "signal is present".
-# Increase this if noise spikes are being falsely detected.
-# Decrease if the signal edges are being clipped.
+# Increase if noise spikes are falsely detected.
+# Decrease if signal edges are being clipped.
 THRESHOLD_FACTOR = 4.0
 
-# Extra samples to keep on BOTH sides of the detected active region.
-# This ensures the reverb tail is fully included.
-# For your ~32154-sample files at ~48 kHz, 1000 samples ≈ 20 ms of margin.
-PAD_SAMPLES = 1000
+# Extra samples kept on BOTH sides of the detected active region.
+# 5000 samples @ 100kHz = 50 ms — captures reverb tail.
+PAD_SAMPLES = 5000
 
 # Sampling rate (Hz) — used only for the time-axis label in the plot.
-SAMPLE_RATE = 48000.0
+SAMPLE_RATE = 100_000.0
 
 # If True, save the zeroed-out signal as a new .dat file alongside the PNG.
 SAVE_DAT = True
@@ -73,89 +80,15 @@ SAVE_DAT = True
 
 
 # --------------------------------------------------------------------------- #
-# Core extraction logic
+# Masking helper  (apply_mask lives here; extraction functions are in utils.py)
 # --------------------------------------------------------------------------- #
 
-def compute_rms_envelope(signal: np.ndarray, window: int) -> np.ndarray:
-    """
-    Compute a sliding-window RMS envelope using a fast cumulative-sum approach.
-
-    Parameters
-    ----------
-    signal : np.ndarray   shape (N,)
-    window : int          sliding window length in samples
-
-    Returns
-    -------
-    envelope : np.ndarray   shape (N,), same length as input
-        Each value is the RMS of the window centred at that sample.
-    """
-    sig_sq = signal.astype(np.float64) ** 2
-    # Pad to handle edges cleanly
-    pad = window // 2
-    padded = np.pad(sig_sq, (pad, pad), mode="edge")
-    cum = np.cumsum(padded)
-    cum = np.concatenate([[0.0], cum])
-    window_sums = cum[window:] - cum[:-window]  # sum of each window
-    # Trim to original length
-    rms = np.sqrt(window_sums[:len(signal)] / window)
-    return rms.astype(np.float32)
-
-
-def estimate_noise_floor(rms_envelope: np.ndarray, percentile: float = 20.0) -> float:
-    """
-    Estimate noise-floor RMS as the (percentile)-th percentile of the envelope.
-    Using a low percentile rather than the minimum avoids being thrown off by
-    single quiet samples inside a loud region.
-    """
-    return float(np.percentile(rms_envelope, percentile))
-
-
-def detect_active_region(
-    rms_envelope: np.ndarray,
-    noise_floor_rms: float,
-    threshold_factor: float,
-    pad_samples: int,
-    signal_length: int,
-) -> tuple:
-    """
-    Find the contiguous active region where RMS > threshold.
-
-    Returns
-    -------
-    (start, end) : int, int
-        Sample indices (inclusive) of the kept region, clipped to [0, N-1].
-    """
-    threshold = threshold_factor * noise_floor_rms
-    active = rms_envelope > threshold
-
-    if not np.any(active):
-        log.warning(
-            "No active region found at threshold_factor=%.1f × %.6f = %.6f. "
-            "The entire signal is below threshold — lower THRESHOLD_FACTOR.",
-            threshold_factor, noise_floor_rms, threshold,
-        )
-        return 0, signal_length - 1
-
-    # First and last sample above threshold
-    indices = np.where(active)[0]
-    raw_start = int(indices[0])
-    raw_end   = int(indices[-1])
-
-    # Add padding to capture reverb tail
-    start = max(0, raw_start - pad_samples)
-    end   = min(signal_length - 1, raw_end + pad_samples)
-
-    return start, end
-
-
 def apply_mask(signal: np.ndarray, start: int, end: int) -> np.ndarray:
-    """
-    Return a copy of `signal` with everything outside [start, end] set to zero.
-    """
+    """Return a copy of `signal` with everything outside [start, end] set to zero."""
     masked = np.zeros_like(signal)
     masked[start : end + 1] = signal[start : end + 1]
     return masked
+
 
 
 # --------------------------------------------------------------------------- #

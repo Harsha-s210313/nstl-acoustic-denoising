@@ -25,7 +25,7 @@ import torch
 from torch.utils.data import Dataset
 
 from config import Config
-from utils import load_dat_file, extract_noise_reference, normalize_signal, to_tensor
+from utils import load_dat_file, extract_noise_reference, extract_active_region, normalize_signal, to_tensor
 
 log = logging.getLogger(__name__)
 
@@ -355,13 +355,27 @@ class NoiseAdaptationUNetDataset(Dataset):
         self.subset = subset
         self.files: List[str] = []
 
-        signal_root = os.path.join(cfg.TRIAL_DATA_DIR, cfg.TRIAL_SIGNAL_SUBDIR)
-        noise_root = os.path.join(cfg.TRIAL_DATA_DIR, cfg.TRIAL_NOISE_SUBDIR)
+        signal_root = os.path.join(cfg.TRIAL_DATA_DIR, cfg.TRIAL_SIGNAL_SUBDIR) \
+            if not os.path.isabs(cfg.TRIAL_SIGNAL_SUBDIR) \
+            else cfg.TRIAL_SIGNAL_SUBDIR
+
+        noise_root = os.path.join(cfg.TRIAL_DATA_DIR, cfg.TRIAL_NOISE_SUBDIR) \
+            if not os.path.isabs(cfg.TRIAL_NOISE_SUBDIR) \
+            else cfg.TRIAL_NOISE_SUBDIR
 
         if subset in ("signal", "all"):
             self.files.extend(self._scan_pri_tree(signal_root))
         if subset in ("noise", "all"):
-            self.files.extend(self._scan_pri_tree(noise_root))
+            # Noise folder is optional — noise reference is now extracted
+            # from inside each signal file via extract_active_region().
+            if os.path.isdir(noise_root):
+                self.files.extend(self._scan_pri_tree(noise_root))
+            else:
+                log.warning(
+                    "Noise directory not found: %r — skipping. "
+                    "Noise reference will be extracted from signal files.",
+                    noise_root,
+                )
 
         if not self.files:
             raise ValueError(
@@ -403,23 +417,40 @@ class NoiseAdaptationUNetDataset(Dataset):
     def __getitem__(self, idx: int):
         path = self.files[idx]
 
-        # Load the file at its actual length (no expected_length → no warnings).
-        # Trial files may have different lengths across Signal/ and Noise/ folders.
-        # We then silently clip or pad to SIGNAL_LENGTH so all tensors in a
-        # batch are the same shape. No warning is logged because mixed lengths
-        # are expected and intentional for this dataset.
-        signal = load_dat_file(path)   # load at actual file length
+        # Load full trial recording at actual file length (no truncation warnings).
+        signal = load_dat_file(path)
 
-        target_len = self.cfg.SIGNAL_LENGTH
-        if len(signal) > target_len:
-            signal = signal[:target_len]                              # silent truncation
-        elif len(signal) < target_len:
-            signal = np.pad(signal, (0, target_len - len(signal)))   # silent zero-pad
+        # ------------------------------------------------------------------ #
+        # Active-region extraction
+        #
+        # Uses energy thresholding to split the recording into:
+        #   active  →  signal+noise window  →  fed to the U-Net denoiser
+        #   noise   →  actual silent segments before/after the pulse
+        #              →  used as noise reference in UnsupervisedNoiseSuppressionLoss
+        #
+        # This is physically correct: the noise reference is real recorded
+        # silence from the same channel, not an estimate.
+        # ------------------------------------------------------------------ #
+        result = extract_active_region(signal, self.cfg)
 
-        signal, _, _ = normalize_signal(signal)
+        active    = result["active"]    # shape: (SIGNAL_LENGTH,)
+        noise_raw = result["noise"]     # shape: (variable — actual noise region)
 
-        noise_ref = extract_noise_reference(signal, window_len=self.cfg.NOISE_REF_WINDOW)
+        # Z-score normalise the active window
+        active, _, _ = normalize_signal(active)
 
-        signal_t = to_tensor(signal)      # (1, SIGNAL_LENGTH)
-        noise_t = to_tensor(noise_ref)    # (1, NOISE_REF_WINDOW)
+        # Take a fixed-length noise reference from the real noise region
+        W = self.cfg.NOISE_REF_WINDOW
+        if len(noise_raw) >= W:
+            # Use the middle of the noise region (most representative)
+            mid = len(noise_raw) // 2
+            noise_ref = noise_raw[mid - W // 2 : mid - W // 2 + W]
+        else:
+            noise_ref = np.pad(noise_raw, (0, W - len(noise_raw)), mode="constant")
+
+        noise_ref, _, _ = normalize_signal(noise_ref.astype(np.float32))
+
+        signal_t = to_tensor(active)      # (1, SIGNAL_LENGTH)
+        noise_t  = to_tensor(noise_ref)   # (1, NOISE_REF_WINDOW)
         return signal_t, noise_t
+

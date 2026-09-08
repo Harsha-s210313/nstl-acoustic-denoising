@@ -6,7 +6,11 @@ Shared utility functions for the NSTL Acoustic Pipeline.
 Provides:
   - set_seed(seed)                  reproducible runs
   - load_dat_file(path, ...)        robust .dat loader (text, one float per line)
-  - extract_noise_reference(signal) lowest-energy sub-window noise estimator
+  - compute_rms_envelope(signal)    sliding-window RMS energy envelope
+  - estimate_noise_floor(rms)       percentile-based noise floor estimate
+  - detect_active_region(...)       energy-threshold based signal window detection
+  - extract_active_region(signal)   full extraction pipeline returning windowed signal + noise
+  - extract_noise_reference(signal) lowest-energy sub-window noise estimator (legacy)
   - normalize_signal(signal)        z-score normalisation
   - to_tensor(array)                numpy → 1-channel PyTorch tensor
   - ensure_dir(path)                mkdir -p equivalent
@@ -155,7 +159,155 @@ def load_dat_file(
 
 
 # --------------------------------------------------------------------------- #
-# Noise reference extraction
+# Active-region extraction  (energy-based signal detection)
+# --------------------------------------------------------------------------- #
+
+def compute_rms_envelope(signal: np.ndarray, window: int) -> np.ndarray:
+    """
+    Compute a sliding-window RMS envelope using a cumulative-sum approach (O(N)).
+
+    Parameters
+    ----------
+    signal : np.ndarray   shape (N,)
+    window : int          sliding window length in samples
+
+    Returns
+    -------
+    envelope : np.ndarray  shape (N,), RMS value centred at each sample.
+    """
+    sig_sq = signal.astype(np.float64) ** 2
+    pad = window // 2
+    padded = np.pad(sig_sq, (pad, pad), mode="edge")
+    cum = np.concatenate([[0.0], np.cumsum(padded)])
+    window_sums = cum[window:] - cum[:-window]
+    rms = np.sqrt(np.maximum(window_sums[:len(signal)], 0.0) / window)
+    return rms.astype(np.float32)
+
+
+def estimate_noise_floor(rms_envelope: np.ndarray, percentile: float = 20.0) -> float:
+    """
+    Estimate noise-floor RMS as a low percentile of the envelope.
+
+    Using a percentile (not the minimum) avoids single quiet samples inside a
+    loud region from under-estimating the true noise floor.
+
+    Parameters
+    ----------
+    rms_envelope : np.ndarray   RMS envelope from compute_rms_envelope()
+    percentile   : float        e.g. 20.0 → 20th-percentile value
+
+    Returns
+    -------
+    float : estimated noise-floor RMS
+    """
+    return float(np.percentile(rms_envelope, percentile))
+
+
+def detect_active_region(
+    rms_envelope: np.ndarray,
+    noise_floor_rms: float,
+    threshold_factor: float,
+    pad_samples: int,
+    signal_length: int,
+) -> tuple:
+    """
+    Find the active signal+noise region where RMS exceeds the threshold.
+
+    Parameters
+    ----------
+    rms_envelope     : np.ndarray  sliding RMS envelope
+    noise_floor_rms  : float       estimated noise floor (from estimate_noise_floor)
+    threshold_factor : float       multiplier: active where RMS > factor × noise_floor
+    pad_samples      : int         extra samples kept on each side (for reverb tail)
+    signal_length    : int         total signal length (to clip indices)
+
+    Returns
+    -------
+    (start, end) : (int, int)
+        Inclusive sample indices of the kept region.
+        Returns (0, signal_length-1) with a warning if nothing is detected.
+    """
+    threshold = threshold_factor * noise_floor_rms
+    active = rms_envelope > threshold
+
+    if not np.any(active):
+        log.warning(
+            "No active region detected (threshold = %.1f × %.6f = %.6f). "
+            "Lower EXTRACTION_THRESHOLD_FACTOR or check your signal.",
+            threshold_factor, noise_floor_rms, threshold,
+        )
+        return 0, signal_length - 1
+
+    indices = np.where(active)[0]
+    start = max(0, int(indices[0])  - pad_samples)
+    end   = min(signal_length - 1, int(indices[-1]) + pad_samples)
+    return start, end
+
+
+def extract_active_region(signal: np.ndarray, cfg) -> dict:
+    """
+    Full extraction pipeline: detect the signal+noise window, return the
+    active region padded/truncated to cfg.SIGNAL_LENGTH, and the actual
+    noise segments (regions outside the window) for use as noise reference.
+
+    Parameters
+    ----------
+    signal : np.ndarray   full trial recording, shape (N,)
+    cfg    : Config       configuration object
+
+    Returns
+    -------
+    dict with keys:
+        "active"      : np.ndarray (SIGNAL_LENGTH,)  — signal+noise window
+        "noise"       : np.ndarray  (variable)        — concatenated noise segments
+        "start"       : int         — detected start index in original signal
+        "end"         : int         — detected end index in original signal
+        "noise_floor" : float       — estimated noise floor RMS
+        "threshold"   : float       — actual threshold used
+    """
+    rms = compute_rms_envelope(signal, window=cfg.EXTRACTION_RMS_WINDOW)
+    noise_floor = estimate_noise_floor(rms, percentile=cfg.EXTRACTION_NOISE_PERCENTILE)
+    start, end = detect_active_region(
+        rms,
+        noise_floor,
+        cfg.EXTRACTION_THRESHOLD_FACTOR,
+        cfg.EXTRACTION_PAD_SAMPLES,
+        len(signal),
+    )
+
+    # --- Active region: pad/truncate to SIGNAL_LENGTH ---
+    raw_active = signal[start : end + 1].copy()
+    target = cfg.SIGNAL_LENGTH
+    if len(raw_active) >= target:
+        active = raw_active[:target]
+    else:
+        active = np.pad(raw_active, (0, target - len(raw_active)), mode="constant")
+
+    # --- Noise segments: actual silence before and after ---
+    noise_parts = []
+    if start > 0:
+        noise_parts.append(signal[:start])
+    if end < len(signal) - 1:
+        noise_parts.append(signal[end + 1:])
+
+    if noise_parts:
+        noise = np.concatenate(noise_parts).astype(np.float32)
+    else:
+        # Edge case: whole signal is "active"; fall back to low-energy window
+        noise = extract_noise_reference(signal, window_len=cfg.NOISE_REF_WINDOW)
+
+    return {
+        "active":      active.astype(np.float32),
+        "noise":       noise,
+        "start":       start,
+        "end":         end,
+        "noise_floor": noise_floor,
+        "threshold":   cfg.EXTRACTION_THRESHOLD_FACTOR * noise_floor,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Noise reference extraction  (legacy — used as fallback)
 # --------------------------------------------------------------------------- #
 
 def extract_noise_reference(

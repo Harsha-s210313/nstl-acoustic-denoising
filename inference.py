@@ -48,6 +48,7 @@ from denoiser_finetune import _load_checkpoint
 from unet import Configurable1DUNet
 from utils import (
     ensure_dir,
+    extract_active_region,
     load_dat_file,
     normalize_signal,
     denormalize_signal,
@@ -263,6 +264,71 @@ def _plot_results(
     plt.close(fig)
 
 
+
+def _plot_trial_results(
+    full_signal: np.ndarray,
+    output_full: np.ndarray,
+    active_input: np.ndarray,
+    denoised_active: np.ndarray,
+    start: int,
+    end: int,
+    snr_db: float,
+    cfg,
+    input_path: str,
+    save_path: str,
+) -> None:
+    """
+    2-panel plot for trial inference (full 4-second view):
+      Panel 1 — Full original recording (noisy input)
+      Panel 2 — Full denoised output (zeros outside active region, denoised inside)
+    """
+    try:
+        import matplotlib
+        matplotlib.use("TkAgg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        log.error("matplotlib not installed. Cannot plot.")
+        return
+
+    sr     = cfg.SAMPLE_RATE
+    fname  = os.path.basename(input_path)
+    n      = len(full_signal)
+    t      = np.arange(n) / sr * 1000.0   # full time axis in ms
+
+    fig, axes = plt.subplots(2, 1, figsize=(16, 7), sharex=True)
+    fig.suptitle(
+        f"NSTL Trial Inference — {fname}\n"
+        f"Active window: {start/sr*1000:.1f} – {end/sr*1000:.1f} ms  |  "
+        f"SNR proxy (active region): {snr_db:.2f} dB",
+        fontsize=11, fontweight="bold",
+    )
+
+    # Panel 1 — Full noisy input
+    axes[0].plot(t, full_signal, color="#4c9be8", linewidth=0.3)
+    axes[0].axvspan(start / sr * 1000, end / sr * 1000, alpha=0.15, color="green")
+    axes[0].set_title("Noisy Input  (green shading = detected active window)")
+    axes[0].set_ylabel("Amplitude")
+    axes[0].grid(True, alpha=0.3)
+
+    # Panel 2 — Denoised output with original overlaid for comparison
+    axes[1].plot(t, full_signal,  color="#4c9be8", linewidth=0.3,
+                 alpha=0.4, label="Original (noisy)")
+    axes[1].plot(t, output_full,  color="#6abf69", linewidth=0.6,
+                 label="Denoised output")
+    axes[1].axvspan(start / sr * 1000, end / sr * 1000, alpha=0.10, color="green")
+    axes[1].set_title("Denoised vs Original  (blue = noisy, green = denoised)")
+    axes[1].set_ylabel("Amplitude")
+    axes[1].set_xlabel("Time (ms)")
+    axes[1].legend(loc="upper right", fontsize=9)
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    log.info("Plot saved → %s", save_path)
+    plt.show()
+    plt.close(fig)
+
+
 # --------------------------------------------------------------------------- #
 # Core inference function
 # --------------------------------------------------------------------------- #
@@ -277,13 +343,15 @@ def run_inference(
     """
     Load the model and run denoising on a single .dat file.
 
-    Parameters
-    ----------
-    cfg            : Config
-    source         : "synthetic" or "trial"
-    checkpoint_path: path to the .pth checkpoint to use
-    input_path     : path to the input .dat file
-    output_dir     : directory to save output .npy arrays
+    For source="synthetic":
+        Loads the file at SIGNAL_LENGTH, denoises, plots 3-panel result.
+
+    For source="trial":
+        Loads the full recording, extracts the active signal+noise window,
+        denoises that window, then reconstructs the full-length output with:
+          - denoised active window in [start:end]
+          - zeros everywhere else (pure noise regions)
+        Plots the full recording context with the denoised window in place.
     """
     ensure_dir(output_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -297,65 +365,113 @@ def run_inference(
     log.info("=" * 60)
 
     # ------------------------------------------------------------------ #
-    # Load and pre-process input
-    # ------------------------------------------------------------------ #
-    raw_signal = load_dat_file(input_path, expected_length=cfg.SIGNAL_LENGTH)
-    normalised, sig_mean, sig_std = normalize_signal(raw_signal)
-    x = to_tensor(normalised).unsqueeze(0).to(device)   # (1, 1, L)
-
-    # ------------------------------------------------------------------ #
-    # Load model
+    # Load model (shared for both sources)
     # ------------------------------------------------------------------ #
     model = Configurable1DUNet(cfg).to(device)
     _load_checkpoint(checkpoint_path, model, cfg)
     model.eval()
 
-    # ------------------------------------------------------------------ #
-    # Inference
-    # ------------------------------------------------------------------ #
-    with torch.no_grad():
-        y = model(x)                     # (1, 1, L)
-
-    # ------------------------------------------------------------------ #
-    # Post-process
-    # ------------------------------------------------------------------ #
-    denoised_norm = y.squeeze().cpu().numpy()             # (L,)
-    denoised_raw = denormalize_signal(denoised_norm, sig_mean, sig_std)
-
-    # Simple SNR-proxy: ratio of input vs. output energy relative to residual
-    input_energy = float(np.mean(raw_signal ** 2))
-    residual = raw_signal - denoised_raw
-    residual_energy = float(np.mean(residual ** 2)) + 1e-12
-    snr_proxy_db = 10.0 * np.log10(input_energy / residual_energy)
-
-    log.info("Input signal  energy : %.6f", input_energy)
-    log.info("Output signal energy : %.6f", float(np.mean(denoised_raw ** 2)))
-    log.info("Residual energy      : %.6f", residual_energy)
-    log.info("SNR proxy (dB)       : %.2f dB", snr_proxy_db)
-
-    # ------------------------------------------------------------------ #
-    # Plot — display on screen and save as PNG
-    # ------------------------------------------------------------------ #
-    ensure_dir(output_dir)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    png_path = os.path.join(output_dir, f"{ts}_{source}_result.png")
 
-    _plot_results(
-        raw_signal=raw_signal,
-        denoised=denoised_raw,
-        residual=residual,
-        snr_db=snr_proxy_db,
-        source=source,
-        input_path=input_path,
-        save_path=png_path,
-    )
-    log.info("Plot saved → %s", png_path)
+    # ================================================================== #
+    # SYNTHETIC path — simple: load SIGNAL_LENGTH samples, denoise, plot
+    # ================================================================== #
+    if source == "synthetic":
+        raw_signal = load_dat_file(input_path, expected_length=cfg.SIGNAL_LENGTH)
+        normalised, sig_mean, sig_std = normalize_signal(raw_signal)
+        x = to_tensor(normalised).unsqueeze(0).to(device)   # (1, 1, L)
+
+        with torch.no_grad():
+            y = model(x)
+
+        denoised_norm = y.squeeze().cpu().numpy()
+        denoised_raw  = denormalize_signal(denoised_norm, sig_mean, sig_std)
+
+        input_energy    = float(np.mean(raw_signal ** 2))
+        residual        = raw_signal - denoised_raw
+        residual_energy = float(np.mean(residual ** 2)) + 1e-12
+        snr_proxy_db    = 10.0 * np.log10(input_energy / residual_energy)
+
+        log.info("Input energy   : %.6f", input_energy)
+        log.info("Output energy  : %.6f", float(np.mean(denoised_raw ** 2)))
+        log.info("SNR proxy (dB) : %.2f dB", snr_proxy_db)
+
+        png_path = os.path.join(output_dir, f"{ts}_synthetic_result.png")
+        _plot_results(
+            raw_signal=raw_signal,
+            denoised=denoised_raw,
+            residual=residual,
+            snr_db=snr_proxy_db,
+            source=source,
+            input_path=input_path,
+            save_path=png_path,
+        )
+        log.info("Plot saved → %s", png_path)
+
+    # ================================================================== #
+    # TRIAL path — extract → denoise → reconstruct full signal
+    # ================================================================== #
+    else:
+        # Step 1: Load full recording
+        full_signal = load_dat_file(input_path)
+        log.info("Full recording: %d samples (%.2f s at %.0f Hz)",
+                 len(full_signal), len(full_signal) / cfg.SAMPLE_RATE, cfg.SAMPLE_RATE)
+
+        # Step 2: Extract active region
+        result = extract_active_region(full_signal, cfg)
+        active   = result["active"]    # (SIGNAL_LENGTH,)
+        start    = result["start"]
+        end      = result["end"]
+        log.info("Active region : samples %d – %d  (%.1f – %.1f ms)",
+                 start, end,
+                 start / cfg.SAMPLE_RATE * 1000,
+                 end   / cfg.SAMPLE_RATE * 1000)
+        log.info("Noise floor   : %.6f  |  Threshold : %.6f", result["noise_floor"], result["threshold"])
+
+        # Step 3: Denoise the active window
+        active_norm, act_mean, act_std = normalize_signal(active)
+        x = to_tensor(active_norm).unsqueeze(0).to(device)   # (1, 1, SIGNAL_LENGTH)
+
+        with torch.no_grad():
+            y = model(x)
+
+        denoised_norm = y.squeeze().cpu().numpy()
+        denoised_active = denormalize_signal(denoised_norm, act_mean, act_std)
+
+        # Step 4: Reconstruct full output — zeros outside, denoised inside
+        output_full = np.zeros_like(full_signal)
+        # Place denoised samples back (only as many as the actual active window)
+        active_len = min(end - start + 1, len(denoised_active))
+        output_full[start : start + active_len] = denoised_active[:active_len]
+
+        # SNR proxy on the active region only
+        active_input   = full_signal[start : end + 1][:len(denoised_active)]
+        residual_active = active_input - denoised_active[:len(active_input)]
+        input_energy    = float(np.mean(active_input ** 2))
+        residual_energy = float(np.mean(residual_active ** 2)) + 1e-12
+        snr_proxy_db    = 10.0 * np.log10(input_energy / residual_energy)
+
+        log.info("Active region SNR proxy : %.2f dB", snr_proxy_db)
+
+        # Step 5: Plot — full recording context
+        png_path = os.path.join(output_dir, f"{ts}_trial_result.png")
+        _plot_trial_results(
+            full_signal=full_signal,
+            output_full=output_full,
+            active_input=full_signal[start : end + 1],
+            denoised_active=denoised_active[:end - start + 1],
+            start=start,
+            end=end,
+            snr_db=snr_proxy_db,
+            cfg=cfg,
+            input_path=input_path,
+            save_path=png_path,
+        )
+        log.info("Plot saved → %s", png_path)
 
 
 # --------------------------------------------------------------------------- #
 # CLI
-# --------------------------------------------------------------------------- #
-
 def _parse_args():
     parser = argparse.ArgumentParser(
         description=(

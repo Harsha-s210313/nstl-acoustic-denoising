@@ -203,9 +203,11 @@ def _load_checkpoint(
             )
     stored_len = ckpt.get("signal_length")
     if stored_len is not None and stored_len != cfg.SIGNAL_LENGTH:
-        raise RuntimeError(
-            f"Checkpoint SIGNAL_LENGTH={stored_len} does not match "
-            f"Config.SIGNAL_LENGTH={cfg.SIGNAL_LENGTH}."
+        log.warning(
+            "Checkpoint SIGNAL_LENGTH=%d differs from Config.SIGNAL_LENGTH=%d. "
+            "This is fine — the U-Net is fully convolutional and its weights are "
+            "valid for any input length. Fine-tuning will adapt to the new length.",
+            stored_len, cfg.SIGNAL_LENGTH,
         )
 
     model.load_state_dict(ckpt["model_state_dict"], strict=strict)
