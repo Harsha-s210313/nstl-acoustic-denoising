@@ -237,23 +237,23 @@ def _plot_results(
     )
 
     # Panel 1 — Noisy input
-    axes[0].plot(samples, raw_signal, color="#e05c5c", linewidth=0.6)
-    axes[0].set_ylabel("Amplitude")
-    axes[0].set_title("Noisy Input")
-    axes[0].grid(True, alpha=0.3)
+    axes.plot(samples, raw_signal, color="#e05c5c", linewidth=0.6)
+    axes.set_ylabel("Amplitude")
+    axes.set_title("Noisy Input")
+    axes.grid(True, alpha=0.3)
 
     # Panel 2 — Denoised output
-    axes[1].plot(samples, denoised, color="#4c9be8", linewidth=0.6)
-    axes[1].set_ylabel("Amplitude")
-    axes[1].set_title("Denoised Output")
-    axes[1].grid(True, alpha=0.3)
+    axes.plot(samples, denoised, color="#4c9be8", linewidth=0.6)
+    axes.set_ylabel("Amplitude")
+    axes.set_title("Denoised Output")
+    axes.grid(True, alpha=0.3)
 
-    # Panel 3 — Residual
-    axes[2].plot(samples, residual, color="#6abf69", linewidth=0.6)
-    axes[2].set_ylabel("Amplitude")
-    axes[2].set_xlabel("Sample index")
-    axes[2].set_title("Residual (Input − Denoised)")
-    axes[2].grid(True, alpha=0.3)
+##    # Panel 3 — Residual
+##    axes[2].plot(samples, residual, color="#6abf69", linewidth=0.6)
+##    axes[2].set_ylabel("Amplitude")
+##    axes[2].set_xlabel("Sample index")
+##    axes[2].set_title("Residual (Input − Denoised)")
+##    axes[2].grid(True, alpha=0.3)
 
     plt.tight_layout()
 
@@ -278,9 +278,9 @@ def _plot_trial_results(
     save_path: str,
 ) -> None:
     """
-    2-panel plot for trial inference (full 4-second view):
-      Panel 1 — Full original recording (noisy input)
-      Panel 2 — Full denoised output (zeros outside active region, denoised inside)
+    2-panel plot — noisy input and denoised output overlaid on both panels:
+      Panel 1 — Full 4-second view  (overview of the whole recording)
+      Panel 2 — Zoomed into the active window  (see exactly what the model changed)
     """
     try:
         import matplotlib
@@ -290,33 +290,55 @@ def _plot_trial_results(
         log.error("matplotlib not installed. Cannot plot.")
         return
 
-    sr     = cfg.SAMPLE_RATE
-    fname  = os.path.basename(input_path)
-    n      = len(full_signal)
-    t      = np.arange(n) / sr * 1000.0   # full time axis in ms
+    sr    = cfg.SAMPLE_RATE
+    fname = os.path.basename(input_path)
+    n     = len(full_signal)
 
-    fig, axes = plt.subplots(2, 1, figsize=(16, 7), sharex=True)
+    # Full time axis (ms)
+    t_full = np.arange(n) / sr * 1000.0
+
+    # Zoomed time axis — only the active window, in ms
+    zoom_start = max(0, start - 500)            # tiny extra margin for context
+    zoom_end   = min(n - 1, end + 500)
+    t_zoom     = np.arange(zoom_start, zoom_end + 1) / sr * 1000.0
+
+    fig, axes = plt.subplots(2, 1, figsize=(16, 8))
     fig.suptitle(
         f"NSTL Trial Inference — {fname}\n"
         f"Active window: {start/sr*1000:.1f} – {end/sr*1000:.1f} ms  |  "
-        f"SNR proxy (active region): {snr_db:.2f} dB",
+        f"SNR proxy: {snr_db:.2f} dB",
         fontsize=11, fontweight="bold",
     )
 
-    # Panel 1 — Full noisy input
-    axes[0].plot(t, full_signal, color="#4c9be8", linewidth=0.3)
-    axes[0].axvspan(start / sr * 1000, end / sr * 1000, alpha=0.15, color="green")
-    axes[0].set_title("Noisy Input  (green shading = detected active window)")
+    # ------------------------------------------------------------------ #
+    # Panel 1 — Full 4-second view: noisy + denoised overlaid
+    # ------------------------------------------------------------------ #
+    axes[0].plot(t_full, full_signal,
+                 color="#4c9be8", linewidth=0.3, alpha=0.6, label="Noisy input")
+    axes[0].plot(t_full, output_full,
+                 color="#e05c5c", linewidth=0.5, label="Denoised output")
+    axes[0].axvspan(start / sr * 1000, end / sr * 1000,
+                    alpha=0.12, color="green", label="Active window")
+    axes[0].set_title("Full Recording — Noisy vs Denoised  (blue = noisy,  red = denoised)")
     axes[0].set_ylabel("Amplitude")
+    axes[0].set_xlabel("Time (ms)")
+    axes[0].legend(loc="upper right", fontsize=9)
     axes[0].grid(True, alpha=0.3)
 
-    # Panel 2 — Denoised output with original overlaid for comparison
-    axes[1].plot(t, full_signal,  color="#4c9be8", linewidth=0.3,
-                 alpha=0.4, label="Original (noisy)")
-    axes[1].plot(t, output_full,  color="#6abf69", linewidth=0.6,
-                 label="Denoised output")
-    axes[1].axvspan(start / sr * 1000, end / sr * 1000, alpha=0.10, color="green")
-    axes[1].set_title("Denoised vs Original  (blue = noisy, green = denoised)")
+    # ------------------------------------------------------------------ #
+    # Panel 2 — Zoomed into active window: noisy + denoised overlaid
+    #            This is where the model's work is visible
+    # ------------------------------------------------------------------ #
+    axes[1].plot(t_zoom, full_signal[zoom_start : zoom_end + 1],
+                 color="#4c9be8", linewidth=0.6, alpha=0.7, label="Noisy input")
+    axes[1].plot(t_zoom, output_full[zoom_start : zoom_end + 1],
+                 color="#e05c5c", linewidth=0.8, label="Denoised output")
+    axes[1].axvspan(start / sr * 1000, end / sr * 1000,
+                    alpha=0.12, color="green", label="Active window")
+    axes[1].set_title(
+        f"Zoomed — Active Window  ({start/sr*1000:.1f} – {end/sr*1000:.1f} ms)"
+        "  ← changes made by the model are visible here"
+    )
     axes[1].set_ylabel("Amplitude")
     axes[1].set_xlabel("Time (ms)")
     axes[1].legend(loc="upper right", fontsize=9)
