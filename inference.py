@@ -290,7 +290,7 @@ def _plot_trial_results(
         log.error("matplotlib not installed. Cannot plot.")
         return
 
-    sr    = cfg.SAMPLE_RATE
+    sr    = cfg.TRIAL_SAMPLE_RATE   # 17,800 Hz — correct for real trial files
     fname = os.path.basename(input_path)
     n     = len(full_signal)
 
@@ -431,57 +431,79 @@ def run_inference(
         log.info("Plot saved → %s", png_path)
 
     # ================================================================== #
-    # TRIAL path — extract → denoise → reconstruct full signal
+    # TRIAL path
+    #
+    # Real trial files: bandpass sampled at 17.8 kHz, ~1.08 s long.
+    # Only ~113 ms of the file contains signal+noise; the rest is noise.
+    # Extraction params use TRIAL_RMS_WINDOW / TRIAL_PAD_SAMPLES which
+    # are correctly scaled for 17.8 kHz (not the synthetic 100 kHz params).
     # ================================================================== #
     else:
-        # Step 1: Load full recording
+        sr = cfg.TRIAL_SAMPLE_RATE          # 17,800 Hz — correct for real files
+
+        # Step 1: Load the full trial file at its natural length
         full_signal = load_dat_file(input_path)
-        log.info("Full recording: %d samples (%.2f s at %.0f Hz)",
-                 len(full_signal), len(full_signal) / cfg.SAMPLE_RATE, cfg.SAMPLE_RATE)
+        n_samples   = len(full_signal)
+        log.info("Loaded: %d samples  (%.1f ms at %.0f Hz)",
+                 n_samples, n_samples / sr * 1000, sr)
 
-        # Step 2: Extract active region
-        result = extract_active_region(full_signal, cfg)
-        active   = result["active"]    # (SIGNAL_LENGTH,)
-        start    = result["start"]
-        end      = result["end"]
-        log.info("Active region : samples %d – %d  (%.1f – %.1f ms)",
-                 start, end,
-                 start / cfg.SAMPLE_RATE * 1000,
-                 end   / cfg.SAMPLE_RATE * 1000)
-        log.info("Noise floor   : %.6f  |  Threshold : %.6f", result["noise_floor"], result["threshold"])
+        # Step 2: Extract active region using trial-specific params
+        from utils import compute_rms_envelope, estimate_noise_floor, detect_active_region
 
-        # Step 3: Denoise the active window
+        rms         = compute_rms_envelope(full_signal, cfg.TRIAL_RMS_WINDOW)
+        noise_floor = estimate_noise_floor(rms, cfg.EXTRACTION_NOISE_PERCENTILE)
+        threshold   = cfg.EXTRACTION_THRESHOLD_FACTOR * noise_floor
+        start, end  = detect_active_region(
+            rms, noise_floor,
+            cfg.EXTRACTION_THRESHOLD_FACTOR,
+            cfg.TRIAL_PAD_SAMPLES,
+            n_samples,
+        )
+        log.info("Noise floor: %.5f  |  Threshold: %.5f  |  RMS peak: %.5f",
+                 noise_floor, threshold, rms.max())
+        log.info("Active region: %d – %d  (%.1f – %.1f ms)",
+                 start, end, start / sr * 1000, end / sr * 1000)
+
+        # Step 3: Slice and pad/truncate to TRIAL_SIGNAL_LENGTH
+        window      = full_signal[start : end + 1]
+        target_len  = cfg.TRIAL_SIGNAL_LENGTH
+        if len(window) >= target_len:
+            active = window[:target_len].copy()
+        else:
+            active = np.pad(window, (0, target_len - len(window)), mode="constant")
+        log.info("Window length: %d samples → padded/truncated to %d",
+                 len(window), target_len)
+
+        # Step 4: Normalise → model → denormalise
         active_norm, act_mean, act_std = normalize_signal(active)
-        x = to_tensor(active_norm).unsqueeze(0).to(device)   # (1, 1, SIGNAL_LENGTH)
+        x = to_tensor(active_norm).unsqueeze(0).to(device)   # (1, 1, TRIAL_SIGNAL_LENGTH)
 
         with torch.no_grad():
             y = model(x)
 
-        denoised_norm = y.squeeze().cpu().numpy()
+        denoised_norm   = y.squeeze().cpu().numpy()[:target_len]
         denoised_active = denormalize_signal(denoised_norm, act_mean, act_std)
 
-        # Step 4: Reconstruct full output — zeros outside, denoised inside
+        # Step 5: Reconstruct full-length output (zeros outside, denoised inside)
         output_full = np.zeros_like(full_signal)
-        # Place denoised samples back (only as many as the actual active window)
-        active_len = min(end - start + 1, len(denoised_active))
+        active_len  = min(end - start + 1, target_len)
         output_full[start : start + active_len] = denoised_active[:active_len]
 
-        # SNR proxy on the active region only
-        active_input   = full_signal[start : end + 1][:len(denoised_active)]
-        residual_active = active_input - denoised_active[:len(active_input)]
+        # SNR proxy on the active region
+        active_input    = full_signal[start : start + active_len]
+        residual_active = active_input - denoised_active[:active_len]
         input_energy    = float(np.mean(active_input ** 2))
         residual_energy = float(np.mean(residual_active ** 2)) + 1e-12
         snr_proxy_db    = 10.0 * np.log10(input_energy / residual_energy)
+        log.info("Active region SNR proxy: %.2f dB", snr_proxy_db)
 
-        log.info("Active region SNR proxy : %.2f dB", snr_proxy_db)
-
-        # Step 5: Plot — full recording context
+        # Step 6: Plot
         png_path = os.path.join(output_dir, f"{ts}_trial_result.png")
         _plot_trial_results(
             full_signal=full_signal,
             output_full=output_full,
-            active_input=full_signal[start : end + 1],
-            denoised_active=denoised_active[:end - start + 1],
+            active_input=active_input,
+            denoised_active=denoised_active[:active_len],
             start=start,
             end=end,
             snr_db=snr_proxy_db,
@@ -490,6 +512,8 @@ def run_inference(
             save_path=png_path,
         )
         log.info("Plot saved → %s", png_path)
+
+
 
 
 # --------------------------------------------------------------------------- #

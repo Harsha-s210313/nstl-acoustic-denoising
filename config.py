@@ -6,27 +6,32 @@ class Config:
     DETERMINISTIC: bool = False
 
     # ------------------------------------------------------------------ #
-    # Signal window length
-    # At 100 kHz:  25000 samples = 250 ms
-    #   → covers 100ms LFM pulse + 60ms reverb + 90ms margin on both sides
-    # NOTE: The pretrained U-Net is fully convolutional — changing this
-    # value does NOT invalidate pretrained weights. Fine-tuning adapts them.
+    # Synthetic data  (pretraining — 100 kHz, 4-second files)
     # ------------------------------------------------------------------ #
     SIGNAL_LENGTH: int = 25000
     SAMPLE_RATE: float = 100_000.0    # Hz
 
     # ------------------------------------------------------------------ #
-    # Active-region extraction  (signal_extractor + trial dataset)
-    # At 100 kHz:
-    #   EXTRACTION_RMS_WINDOW = 1000  →  10 ms smoothing window
-    #   EXTRACTION_PAD_SAMPLES = 5000 →  50 ms margin on each side
-    # Tune EXTRACTION_THRESHOLD_FACTOR if:
-    #   too high → signal edges get clipped, or nothing detected
-    #   too low  → noise spikes get included in the active region
+    # Real trial data  (bandpass sampled at 17.8 kHz, ~1 second files)
+    #   Signal duration: ~113 ms  →  ~2011 samples at 17.8 kHz
+    #   Total file:      ~1.08 s  →  ~19,299 samples
+    #
+    # Extraction params recomputed for 17.8 kHz:
+    #   TRIAL_RMS_WINDOW   = 10ms  × 17800  =  178 samples
+    #   TRIAL_PAD_SAMPLES  = 50ms  × 17800  =  890 samples
+    #   TRIAL_SIGNAL_LENGTH covers pulse (2011) + 2×pad (1780) + margin → 5000
     # ------------------------------------------------------------------ #
-    EXTRACTION_RMS_WINDOW: int        = 1000
-    EXTRACTION_THRESHOLD_FACTOR: float = 2.0   # works for sine-wave LFM (RMS = amp/√2)
-    EXTRACTION_PAD_SAMPLES: int       = 5000   # 50 ms reverb margin
+    TRIAL_SAMPLE_RATE: float  = 17_800.0   # Hz — bandpass sampling rate
+    TRIAL_SIGNAL_LENGTH: int  = 5000       # samples fed to U-Net for real trial files
+    TRIAL_RMS_WINDOW: int     = 178        # 10ms smoothing window at 17.8 kHz
+    TRIAL_PAD_SAMPLES: int    = 890        # 50ms margin on each side of detected pulse
+
+    # ------------------------------------------------------------------ #
+    # Active-region extraction  (shared threshold params for both rates)
+    # ------------------------------------------------------------------ #
+    EXTRACTION_RMS_WINDOW: int        = 1000   # synthetic (100 kHz) — 10ms
+    EXTRACTION_THRESHOLD_FACTOR: float = 2.0   # same for both
+    EXTRACTION_PAD_SAMPLES: int       = 5000   # synthetic (100 kHz) — 50ms
     EXTRACTION_NOISE_PERCENTILE: float = 20.0
 
     SYNTHETIC_IS_COMPLEX: bool = False
