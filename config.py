@@ -94,8 +94,10 @@ class Config:
     FINETUNE_LR_FACTOR: float = 0.5
     FINETUNE_LR_PATIENCE: int = 5
     FINETUNE_LR_MIN: float = 1e-7
-    FINETUNE_NOISE_LAMBDA: float = 1.0
-    NOISE_REF_WINDOW: int = 2000   # 20 ms at 100 kHz
+    FINETUNE_NOISE_LAMBDA: float = 0.7  # 0.7 = 70% energy-matching + 30% smoothness
+                                         # (was 1.0, which zeroed the smooth term)
+    NOISE_REF_WINDOW: int = 2000         # 20ms at 100 kHz — for synthetic data
+    TRIAL_NOISE_REF_WINDOW: int = 356    # 20ms at 17.8 kHz — for real trial data
 
     DETECTOR_EPOCHS: int = 50
     DETECTOR_BATCH_SIZE: int = 16

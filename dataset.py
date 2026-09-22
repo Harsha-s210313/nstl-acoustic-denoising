@@ -421,36 +421,58 @@ class NoiseAdaptationUNetDataset(Dataset):
         signal = load_dat_file(path)
 
         # ------------------------------------------------------------------ #
-        # Active-region extraction
+        # Active-region extraction using TRIAL-specific params (17.8 kHz)
         #
-        # Uses energy thresholding to split the recording into:
-        #   active  →  signal+noise window  →  fed to the U-Net denoiser
-        #   noise   →  actual silent segments before/after the pulse
-        #              →  used as noise reference in UnsupervisedNoiseSuppressionLoss
+        # The synthetic EXTRACTION_* params are for 100 kHz and would fail here:
+        #   RMS_WINDOW=1000 → 56ms at 17.8 kHz (too coarse for 113ms pulse)
+        #   PAD_SAMPLES=5000 → 281ms at 17.8 kHz (would cover most of the file)
         #
-        # This is physically correct: the noise reference is real recorded
-        # silence from the same channel, not an estimate.
+        # TRIAL_RMS_WINDOW=178  →  10ms at 17.8 kHz  ✓
+        # TRIAL_PAD_SAMPLES=890 →  50ms at 17.8 kHz  ✓
         # ------------------------------------------------------------------ #
-        result = extract_active_region(signal, self.cfg)
+        from utils import compute_rms_envelope, estimate_noise_floor, detect_active_region
 
-        active    = result["active"]    # shape: (SIGNAL_LENGTH,)
-        noise_raw = result["noise"]     # shape: (variable — actual noise region)
+        rms         = compute_rms_envelope(signal, self.cfg.TRIAL_RMS_WINDOW)
+        noise_floor = estimate_noise_floor(rms, self.cfg.EXTRACTION_NOISE_PERCENTILE)
+        start, end  = detect_active_region(
+            rms, noise_floor,
+            self.cfg.EXTRACTION_THRESHOLD_FACTOR,
+            self.cfg.TRIAL_PAD_SAMPLES,
+            len(signal),
+        )
 
-        # Z-score normalise the active window
-        active, _, _ = normalize_signal(active)
-
-        # Take a fixed-length noise reference from the real noise region
-        W = self.cfg.NOISE_REF_WINDOW
-        if len(noise_raw) >= W:
-            # Use the middle of the noise region (most representative)
-            mid = len(noise_raw) // 2
-            noise_ref = noise_raw[mid - W // 2 : mid - W // 2 + W]
+        # Slice detected window and pad/truncate to TRIAL_SIGNAL_LENGTH
+        window     = signal[start : end + 1]
+        target_len = self.cfg.TRIAL_SIGNAL_LENGTH
+        if len(window) >= target_len:
+            active = window[:target_len].copy()
         else:
-            noise_ref = np.pad(noise_raw, (0, W - len(noise_raw)), mode="constant")
+            active = np.pad(window, (0, target_len - len(window)), mode="constant")
 
-        noise_ref, _, _ = normalize_signal(noise_ref.astype(np.float32))
+        # Noise reference: take a segment from the silence BEFORE the active window.
+        # If there isn't enough silence before, take from after.
+        W = self.cfg.TRIAL_NOISE_REF_WINDOW   # 20ms at 17.8 kHz = 356 samples
+        if start >= W:
+            # Take noise from right before the active window
+            noise_raw = signal[start - W : start].astype(np.float32)
+        elif len(signal) - end - 1 >= W:
+            # Take noise from right after the active window
+            noise_raw = signal[end + 1 : end + 1 + W].astype(np.float32)
+        else:
+            # Fallback: use the first W samples (may include some signal edge)
+            noise_raw = signal[:W].astype(np.float32)
 
-        signal_t = to_tensor(active)      # (1, SIGNAL_LENGTH)
-        noise_t  = to_tensor(noise_ref)   # (1, NOISE_REF_WINDOW)
+        # Z-score normalise (use the same stats for both, derived from active)
+        active, act_mean, act_std = normalize_signal(active)
+
+        # Normalise noise ref with the same stats so it's on the same scale
+        if act_std > 1e-8:
+            noise_ref = (noise_raw - act_mean) / act_std
+        else:
+            noise_ref = noise_raw
+
+        signal_t = to_tensor(active)                        # (1, TRIAL_SIGNAL_LENGTH)
+        noise_t  = to_tensor(noise_ref.astype(np.float32)) # (1, TRIAL_NOISE_REF_WINDOW)
         return signal_t, noise_t
+
 

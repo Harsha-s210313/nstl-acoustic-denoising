@@ -57,42 +57,44 @@ log = logging.getLogger(__name__)
 
 class UnsupervisedNoiseSuppressionLoss(nn.Module):
     """
-    Penalise the denoiser output for retaining noise energy.
+    Unsupervised loss for fine-tuning the denoiser on real trial data.
 
-    The loss has two terms:
+    Three terms:
 
-    1. **Noise-energy term**: The output is correlated with the noise reference
-       by comparing the mean squared amplitude of (output − noisy_input).
-       We want the denoiser to move the signal *away* from the noisy input in
-       the direction that reduces noise energy.
+    1. **Energy matching** (primary term):
+       The expected clean signal power ≈ noisy_power − noise_power.
+       We penalise the denoised output for deviating from this target energy.
 
-       loss_noise = mean((denoised - noisy)^2)
-           — this penalises large deviations; on its own it would push the
-             denoiser toward the identity.  Combined with the spectral term
-             below it biases the solution toward smoother outputs.
+         target_power = clamp(E[noisy²] − E[noise_ref²],  min=ε)
+         loss_energy  = E[(E[denoised²] − target_power)²]
 
-    2. **Spectral smoothness term**: Penalise high-frequency energy in the
-       output (a soft noise filter prior for underwater acoustic signals).
+       This directly guides the model: remove the noise energy, keep the signal.
+       (Previous version used mean((denoised-noisy)²) which is minimised at
+        denoised=noisy — i.e., the identity / zero-denoising solution. Fixed.)
 
-       loss_smooth = mean(diff(denoised)^2)
+    2. **Spectral smoothness** (regularisation):
+       Penalise high-frequency energy in the output.  LFM signals are smooth;
+       residual noise is rough.
 
-    Total loss = lambda * loss_noise + (1 - lambda) * loss_smooth
+         loss_smooth = E[(denoised[t+1] − denoised[t])²]
 
-    where lambda = Config.FINETUNE_NOISE_LAMBDA.
+    3. **Over-suppression guard**:
+       If denoised power drops below the noise floor the model is erasing signal.
+       Soft penalty to prevent this.
 
-    NOTE: This is an unsupervised objective.  It does NOT require clean
-    ground-truth signals.  The noise_profile returned by
-    NoiseAdaptationUNetDataset is passed in for future extensions (e.g.,
-    noise-matched spectral subtraction); the current implementation uses
-    the structural loss only.
+         loss_over = E[clamp(noise_power − signal_power,  min=0)]
+
+    Total = lam × loss_energy + (1−lam) × loss_smooth + 0.1 × loss_over
 
     Parameters
     ----------
     lam : float
-        Weight on the noise-energy term (0 ≤ lam ≤ 1).
+        Weight on energy-matching term.  0.7 recommended:
+        70 % energy matching + 30 % smoothness.
+        (Previous default was 1.0, which zeroed out the smooth term entirely.)
     """
 
-    def __init__(self, lam: float = 1.0):
+    def __init__(self, lam: float = 0.7):
         super().__init__()
         self.lam = lam
 
@@ -105,38 +107,37 @@ class UnsupervisedNoiseSuppressionLoss(nn.Module):
         """
         Parameters
         ----------
-        denoised      : (B, 1, L)   — U-Net output
-        noisy         : (B, 1, L)   — raw trial input
-        noise_profile : (B, 1, W)   — noise reference segment (W ≤ L)
-                        Not directly used in the loss computation here but
-                        available for future spectral-subtraction extensions.
+        denoised      : (B, 1, L)  — U-Net output
+        noisy         : (B, 1, L)  — normalised trial input
+        noise_profile : (B, 1, W)  — noise reference segment from quiet region
 
         Returns
         -------
         torch.Tensor : scalar loss
         """
-        # Term 1: how much the output differs from the noisy input
-        # (penalises the identity solution; combined with term 2 it shapes
-        # the denoiser toward smoother, lower-noise outputs)
-        diff = denoised - noisy
-        loss_noise = torch.mean(diff ** 2)
+        # Per-sample power estimates  →  (B, 1, 1)
+        noisy_power  = torch.mean(noisy         ** 2, dim=-1, keepdim=True)
+        noise_power  = torch.mean(noise_profile ** 2, dim=-1, keepdim=True)
+        signal_power = torch.mean(denoised      ** 2, dim=-1, keepdim=True)
 
-        # Term 2: penalise sharp transitions in the output (smoothness prior)
-        grad = denoised[:, :, 1:] - denoised[:, :, :-1]  # finite differences
+        # Term 1: Energy matching
+        # Target = noisy_power − noise_power  (what the clean signal power should be)
+        # Clamp to ε so target is never negative (noise > noisy only in edge cases)
+        target_power = torch.clamp(noisy_power - noise_power, min=1e-8)
+        loss_energy  = torch.mean((signal_power - target_power) ** 2)
+
+        # Term 2: Spectral smoothness — penalise high-frequency noise in output
+        grad = denoised[:, :, 1:] - denoised[:, :, :-1]   # finite differences
         loss_smooth = torch.mean(grad ** 2)
 
-        # Noise-profile-based regularisation: the denoised output should not
-        # contain energy significantly larger than the noise floor.
-        # Estimate noise power from the reference window.
-        noise_power = torch.mean(noise_profile ** 2, dim=-1, keepdim=True)  # (B,1,1)
-        signal_power = torch.mean(denoised ** 2, dim=-1, keepdim=True)      # (B,1,1)
-        # Soft penalty: denoised power should exceed noise power (otherwise the
-        # denoiser is just suppressing everything).  We penalise denoised power
-        # that is LOWER than the noise floor (avoids over-suppression).
-        over_suppression = torch.clamp(noise_power - signal_power, min=0.0)
-        loss_over_suppress = torch.mean(over_suppression)
+        # Term 3: Over-suppression guard
+        # Penalise if denoised power < noise floor (model is erasing the signal)
+        over_suppress      = torch.clamp(noise_power - signal_power, min=0.0)
+        loss_over_suppress = torch.mean(over_suppress)
 
-        total = self.lam * loss_noise + (1.0 - self.lam) * loss_smooth + 0.1 * loss_over_suppress
+        total = (self.lam * loss_energy
+                 + (1.0 - self.lam) * loss_smooth
+                 + 0.1 * loss_over_suppress)
         return total
 
 
