@@ -361,19 +361,27 @@ def run_inference(
     checkpoint_path: str,
     input_path: str,
     output_dir: str,
+    manual_start_ms: float = -1.0,
+    manual_end_ms: float   = -1.0,
 ) -> None:
     """
     Load the model and run denoising on a single .dat file.
 
     For source="synthetic":
-        Loads the file at SIGNAL_LENGTH, denoises, plots 3-panel result.
+        Loads the file at SIGNAL_LENGTH, denoises, plots result.
 
     For source="trial":
-        Loads the full recording, extracts the active signal+noise window,
-        denoises that window, then reconstructs the full-length output with:
-          - denoised active window in [start:end]
-          - zeros everywhere else (pure noise regions)
-        Plots the full recording context with the denoised window in place.
+        Loads the full recording, finds the active signal+noise window
+        (auto via energy detection, or manually via manual_start_ms/end_ms),
+        denoises that window, reconstructs the full-length output with zeros
+        outside the active region.
+
+    Parameters
+    ----------
+    manual_start_ms, manual_end_ms : float
+        If both ≥ 0, bypass auto-detection and use this time window (ms).
+        Use this when bursty acoustic noise causes the energy detector to
+        flag the entire file.  Set to -1.0 (default) for auto-detection.
     """
     ensure_dir(output_dir)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -432,37 +440,42 @@ def run_inference(
 
     # ================================================================== #
     # TRIAL path
-    #
-    # Real trial files: bandpass sampled at 17.8 kHz, ~1.08 s long.
-    # Only ~113 ms of the file contains signal+noise; the rest is noise.
-    # Extraction params use TRIAL_RMS_WINDOW / TRIAL_PAD_SAMPLES which
-    # are correctly scaled for 17.8 kHz (not the synthetic 100 kHz params).
     # ================================================================== #
     else:
-        sr = cfg.TRIAL_SAMPLE_RATE          # 17,800 Hz — correct for real files
+        sr = cfg.TRIAL_SAMPLE_RATE          # 17,800 Hz
 
-        # Step 1: Load the full trial file at its natural length
+        # Step 1: Load the full trial file
         full_signal = load_dat_file(input_path)
         n_samples   = len(full_signal)
         log.info("Loaded: %d samples  (%.1f ms at %.0f Hz)",
                  n_samples, n_samples / sr * 1000, sr)
 
-        # Step 2: Extract active region using trial-specific params
+        # Step 2: Determine active window
+        #   Option A — Manual override (use when bursty noise defeats auto-detection)
+        #   Option B — Auto energy-based extraction
         from utils import compute_rms_envelope, estimate_noise_floor, detect_active_region
 
-        rms         = compute_rms_envelope(full_signal, cfg.TRIAL_RMS_WINDOW)
-        noise_floor = estimate_noise_floor(rms, cfg.EXTRACTION_NOISE_PERCENTILE)
-        threshold   = cfg.EXTRACTION_THRESHOLD_FACTOR * noise_floor
-        start, end  = detect_active_region(
-            rms, noise_floor,
-            cfg.EXTRACTION_THRESHOLD_FACTOR,
-            cfg.TRIAL_PAD_SAMPLES,
-            n_samples,
-        )
-        log.info("Noise floor: %.5f  |  Threshold: %.5f  |  RMS peak: %.5f",
-                 noise_floor, threshold, rms.max())
-        log.info("Active region: %d – %d  (%.1f – %.1f ms)",
-                 start, end, start / sr * 1000, end / sr * 1000)
+        if manual_start_ms >= 0.0 and manual_end_ms >= 0.0:
+            # Manual override: convert ms → samples, clamp to file bounds
+            start = int(max(0,             manual_start_ms * sr / 1000.0))
+            end   = int(min(n_samples - 1, manual_end_ms   * sr / 1000.0))
+            log.info("Manual window: %d – %d  (%.1f – %.1f ms) [override active]",
+                     start, end, start / sr * 1000, end / sr * 1000)
+        else:
+            # Auto-detection using energy threshold
+            rms         = compute_rms_envelope(full_signal, cfg.TRIAL_RMS_WINDOW)
+            noise_floor = estimate_noise_floor(rms, cfg.EXTRACTION_NOISE_PERCENTILE)
+            threshold   = cfg.EXTRACTION_THRESHOLD_FACTOR * noise_floor
+            start, end  = detect_active_region(
+                rms, noise_floor,
+                cfg.EXTRACTION_THRESHOLD_FACTOR,
+                cfg.TRIAL_PAD_SAMPLES,
+                n_samples,
+            )
+            log.info("Noise floor: %.5f  |  Threshold: %.5f  |  RMS peak: %.5f",
+                     noise_floor, threshold, rms.max())
+            log.info("Active region: %d – %d  (%.1f – %.1f ms)",
+                     start, end, start / sr * 1000, end / sr * 1000)
 
         # Step 3: Slice and pad/truncate to TRIAL_SIGNAL_LENGTH
         window      = full_signal[start : end + 1]

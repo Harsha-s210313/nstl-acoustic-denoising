@@ -44,7 +44,7 @@ class Config:
     TRIAL_DATA_DIR: str = os.path.join("data", "trial_data")
     # _scan_pri_tree expects:  <SUBDIR>/PRI_XX/channelYYY.dat
     # So point one level ABOVE PRI_TEST → scanner finds PRI_TEST as the PRI folder.
-    TRIAL_SIGNAL_SUBDIR: str = r"C:\Users\HARSHA\.gemini\antigravity\scratch\nstl_acoustic\data\trial_data\Signal"
+    TRIAL_SIGNAL_SUBDIR: str = r"C:\Users\HARSHA\Downloads\TransferNow-20260922dMEzqqdd"
     # Noise folder doesn't exist for generated data → skipped with a warning (noise
     # reference is extracted from inside each signal file automatically).
     TRIAL_NOISE_SUBDIR: str  = r"C:\Users\HARSHA\.gemini\antigravity\scratch\nstl_acoustic\data\trial_data\Noise"
@@ -106,7 +106,7 @@ class Config:
     DETECTOR_VAL_SPLIT: float = 0.2
     DETECTOR_PATIENCE: int = 15
 
-    INFERENCE_DEFAULT_SOURCE: str = "synthetic"
-    INFERENCE_TRIAL_PRI: str = "pri01"
+    INFERENCE_DEFAULT_SOURCE: str = r"C:\Users\HARSHA\Downloads\TransferNow-20260922dMEzqqdd"
+    INFERENCE_TRIAL_PRI: str = "pri"
     INFERENCE_TRIAL_CHANNEL: int = 0
     INFERENCE_OUTPUT_DIR: str = "inference_output"
