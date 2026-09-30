@@ -1,67 +1,49 @@
 """
-utils.py
---------
-Shared utility functions for the NSTL Acoustic Pipeline.
-
-Provides:
-  - set_seed(seed)                  reproducible runs
-  - load_dat_file(path, ...)        robust .dat loader (text, one float per line)
-  - compute_rms_envelope(signal)    sliding-window RMS energy envelope
-  - estimate_noise_floor(rms)       percentile-based noise floor estimate
-  - detect_active_region(...)       energy-threshold based signal window detection
-  - extract_active_region(signal)   full extraction pipeline returning windowed signal + noise
-  - extract_noise_reference(signal) lowest-energy sub-window noise estimator (legacy)
-  - normalize_signal(signal)        z-score normalisation
-  - to_tensor(array)                numpy → 1-channel PyTorch tensor
-  - ensure_dir(path)                mkdir -p equivalent
-
-All functions are stateless and import-safe.
+Stateless, import-safe utility functions for signal processing, file I/O,
+envelope detection, and tensor conversions.
 """
 
 import os
 import random
 import logging
-from typing import Optional, Tuple
-
+from typing import Tuple, Dict, Any, Optional, Union
 import numpy as np
+import torch
 
-log = logging.getLogger(__name__)
+try:
+    from .config import Config
+except (ImportError, ValueError):
+    from config import Config
+
+logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------------------------------- #
-# Reproducibility
-# --------------------------------------------------------------------------- #
-
-def set_seed(seed: int, deterministic: bool = False) -> None:
+def set_seed(seed: int = 42, deterministic: bool = False) -> None:
     """
-    Seed Python, NumPy, and PyTorch for reproducible runs.
-
-    Parameters
-    ----------
-    seed : int
-        Random seed value.
-    deterministic : bool
-        If True, enable deterministic CUDA algorithms (slower but fully
-        reproducible on GPU).  Ignored when CUDA is unavailable.
+    Set seeds across Python, NumPy, and PyTorch for reproducible runs.
     """
     random.seed(seed)
     np.random.seed(seed)
-
-    try:
-        import torch
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        if deterministic:
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
-    except ImportError:
-        pass  # torch not available; numpy/random still seeded
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
-# --------------------------------------------------------------------------- #
-# .dat file loading
-# --------------------------------------------------------------------------- #
+def ensure_dir(path: str) -> None:
+    """
+    Ensure directory exists on disk.
+    If path has a file extension or is a file path, creates its parent directory.
+    """
+    if os.path.splitext(path)[1]:
+        dir_path = os.path.dirname(path)
+    else:
+        dir_path = path
+    if dir_path:
+        os.makedirs(dir_path, exist_ok=True)
+
 
 def load_dat_file(
     path: str,
@@ -69,356 +51,252 @@ def load_dat_file(
     verbose: bool = False,
 ) -> np.ndarray:
     """
-    Load a .dat file containing one float value per line (plain-text format).
-
-    The loader is intentionally robust:
-      - Skips blank lines.
-      - Skips comment lines (starting with '#').
-      - Handles both Unix and Windows line endings.
-      - If the resulting array is shorter than ``expected_length``, it is
-        zero-padded with a warning.
-      - If it is longer than ``expected_length``, it is truncated with a
-        warning.
-
-    Parameters
-    ----------
-    path : str
-        Absolute or relative path to the .dat file.
-    expected_length : int, optional
-        If given, the returned array is guaranteed to have this exact length.
-    verbose : bool
-        If True, print file-loading diagnostics.
-
-    Returns
-    -------
-    np.ndarray
-        1-D float32 array of signal samples.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the file does not exist.
-    ValueError
-        If the file exists but contains no parseable numeric values.
+    Robustly parse plain-text .dat files (one float per line).
+    - Skips blank lines and lines starting with '#'
+    - Tolerates CRLF (\\r\\n) and LF (\\n) line endings
+    - Tracks and counts parse errors
+    - Raises ValueError if no valid floats could be parsed
+    - Zero-pads or truncates to expected_length with a logged warning if specified
+    - Returns a 1D float32 numpy array
     """
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"[load_dat_file] File not found: {path!r}")
+        raise FileNotFoundError(f"Data file not found: {path}")
 
-    samples = []
+    values = []
     parse_errors = 0
 
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        for line_no, raw_line in enumerate(fh, start=1):
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line_num, line in enumerate(f, start=1):
+            cleaned = line.strip()
+            if not cleaned or cleaned.startswith("#"):
                 continue
             try:
-                samples.append(float(line))
+                val = float(cleaned)
+                values.append(val)
             except ValueError:
                 parse_errors += 1
                 if verbose:
-                    print(
-                        f"  [load_dat_file] Parse error at line {line_no} in"
-                        f" {os.path.basename(path)!r}: {line!r}"
-                    )
+                    logger.warning("Parse error at line %d in %s: '%s'", line_num, path, cleaned)
 
-    if not samples:
-        raise ValueError(
-            f"[load_dat_file] No parseable values found in {path!r}. "
-            "Check the file format."
-        )
+    if parse_errors > 0:
+        logger.warning("Encountered %d unparseable lines in %s", parse_errors, path)
 
-    arr = np.asarray(samples, dtype=np.float32)
-    raw_len = len(arr)
+    if len(values) == 0:
+        raise ValueError(f"No valid numeric data found in file: {path}")
 
-    if verbose:
-        print(
-            f"  [load_dat_file] {os.path.basename(path)!r}: "
-            f"loaded {raw_len} samples"
-            + (f", {parse_errors} parse errors ignored" if parse_errors else "")
-        )
+    arr = np.asarray(values, dtype=np.float32)
 
-    if expected_length is not None and raw_len != expected_length:
-        if raw_len < expected_length:
-            pad = expected_length - raw_len
-            arr = np.pad(arr, (0, pad), mode="constant")
-            log.warning(
-                "Signal in %r is shorter than expected (%d < %d); "
-                "zero-padded by %d samples.",
-                path, raw_len, expected_length, pad,
+    if expected_length is not None:
+        curr_len = len(arr)
+        if curr_len < expected_length:
+            logger.warning(
+                "File %s has length %d < expected %d. Zero-padding.",
+                path, curr_len, expected_length
             )
-        else:
+            pad_width = expected_length - curr_len
+            arr = np.pad(arr, (0, pad_width), mode="constant", constant_values=0.0)
+        elif curr_len > expected_length:
+            logger.warning(
+                "File %s has length %d > expected %d. Truncating.",
+                path, curr_len, expected_length
+            )
             arr = arr[:expected_length]
-            log.warning(
-                "Signal in %r is longer than expected (%d > %d); "
-                "truncated to %d samples.",
-                path, raw_len, expected_length, expected_length,
-            )
 
     return arr
 
 
-# --------------------------------------------------------------------------- #
-# Active-region extraction  (energy-based signal detection)
-# --------------------------------------------------------------------------- #
+def save_dat_file(path: str, signal: Union[np.ndarray, torch.Tensor]) -> None:
+    """
+    Save 1D signal to a plain-text .dat file (one float per line).
+    """
+    ensure_dir(path)
+    if isinstance(signal, torch.Tensor):
+        signal = signal.detach().cpu().squeeze().numpy()
+    signal = np.asarray(signal, dtype=np.float32).ravel()
+
+    with open(path, "w", encoding="utf-8") as f:
+        for val in signal:
+            f.write(f"{val:.8e}\n")
+
 
 def compute_rms_envelope(signal: np.ndarray, window: int) -> np.ndarray:
     """
-    Compute a sliding-window RMS envelope using a cumulative-sum approach (O(N)).
-
-    Parameters
-    ----------
-    signal : np.ndarray   shape (N,)
-    window : int          sliding window length in samples
-
-    Returns
-    -------
-    envelope : np.ndarray  shape (N,), RMS value centred at each sample.
+    Compute moving RMS envelope in O(N) time using cumulative sums with edge padding.
+    Output has identical length to input signal.
     """
-    sig_sq = signal.astype(np.float64) ** 2
-    pad = window // 2
-    padded = np.pad(sig_sq, (pad, pad), mode="edge")
-    cum = np.concatenate([[0.0], np.cumsum(padded)])
-    window_sums = cum[window:] - cum[:-window]
-    rms = np.sqrt(np.maximum(window_sums[:len(signal)], 0.0) / window)
+    signal = np.asarray(signal, dtype=np.float64)
+    n = len(signal)
+    if n == 0:
+        return np.array([], dtype=np.float32)
+    if window <= 1:
+        return np.abs(signal).astype(np.float32)
+
+    window = min(window, n)
+    sq = signal ** 2
+
+    # Symmetrical edge padding
+    pad_left = window // 2
+    pad_right = window - 1 - pad_left
+    sq_padded = np.pad(sq, (pad_left, pad_right), mode="edge")
+
+    # Cumulative sum for O(N) moving window calculation
+    cumsum = np.cumsum(np.concatenate(([0.0], sq_padded)))
+    window_sum = cumsum[window: window + n] - cumsum[:n]
+    mean_sq = np.maximum(window_sum / float(window), 0.0)
+    rms = np.sqrt(mean_sq)
     return rms.astype(np.float32)
 
 
-def estimate_noise_floor(rms_envelope: np.ndarray, percentile: float = 20.0) -> float:
+def estimate_noise_floor(rms: np.ndarray, percentile: float = 20.0) -> float:
     """
-    Estimate noise-floor RMS as a low percentile of the envelope.
-
-    Using a percentile (not the minimum) avoids single quiet samples inside a
-    loud region from under-estimating the true noise floor.
-
-    Parameters
-    ----------
-    rms_envelope : np.ndarray   RMS envelope from compute_rms_envelope()
-    percentile   : float        e.g. 20.0 → 20th-percentile value
-
-    Returns
-    -------
-    float : estimated noise-floor RMS
+    Estimate background noise floor as a low percentile of the RMS envelope.
     """
-    return float(np.percentile(rms_envelope, percentile))
+    if len(rms) == 0:
+        return 0.0
+    return float(np.percentile(rms, percentile))
 
 
 def detect_active_region(
-    rms_envelope: np.ndarray,
-    noise_floor_rms: float,
+    rms: np.ndarray,
+    noise_floor: float,
     threshold_factor: float,
     pad_samples: int,
     signal_length: int,
-) -> tuple:
+) -> Tuple[int, int]:
     """
-    Find the active signal+noise region where RMS exceeds the threshold.
-
-    Parameters
-    ----------
-    rms_envelope     : np.ndarray  sliding RMS envelope
-    noise_floor_rms  : float       estimated noise floor (from estimate_noise_floor)
-    threshold_factor : float       multiplier: active where RMS > factor × noise_floor
-    pad_samples      : int         extra samples kept on each side (for reverb tail)
-    signal_length    : int         total signal length (to clip indices)
-
-    Returns
-    -------
-    (start, end) : (int, int)
-        Inclusive sample indices of the kept region.
-        Returns (0, signal_length-1) with a warning if nothing is detected.
+    Identify (start, end) index bounds of active pulse region.
+    Pads detected region and clamps within [0, signal_length].
+    Falls back to (0, signal_length) with a warning if no samples exceed threshold.
     """
-    threshold = threshold_factor * noise_floor_rms
-    active = rms_envelope > threshold
+    threshold = noise_floor * threshold_factor
+    active_indices = np.where(rms > threshold)[0]
 
-    if not np.any(active):
-        log.warning(
-            "No active region detected (threshold = %.1f × %.6f = %.6f). "
-            "Lower EXTRACTION_THRESHOLD_FACTOR or check your signal.",
-            threshold_factor, noise_floor_rms, threshold,
+    if len(active_indices) == 0:
+        logger.warning(
+            "No samples exceeded threshold (factor=%.2f, floor=%.4e). "
+            "Falling back to entire signal length.",
+            threshold_factor, noise_floor
         )
-        return 0, signal_length - 1
+        return 0, signal_length
 
-    indices = np.where(active)[0]
-    start = max(0, int(indices[0])  - pad_samples)
-    end   = min(signal_length - 1, int(indices[-1]) + pad_samples)
+    raw_start = int(np.min(active_indices))
+    raw_end = int(np.max(active_indices)) + 1
+
+    start = max(0, raw_start - pad_samples)
+    end = min(signal_length, raw_end + pad_samples)
+
     return start, end
 
 
-def extract_active_region(signal: np.ndarray, cfg) -> dict:
+def extract_active_region(
+    signal: np.ndarray,
+    cfg: Config,
+    target_length: Optional[int] = None,
+) -> Dict[str, Any]:
     """
-    Full extraction pipeline: detect the signal+noise window, return the
-    active region padded/truncated to cfg.SIGNAL_LENGTH, and the actual
-    noise segments (regions outside the window) for use as noise reference.
-
-    Parameters
-    ----------
-    signal : np.ndarray   full trial recording, shape (N,)
-    cfg    : Config       configuration object
-
-    Returns
-    -------
-    dict with keys:
-        "active"      : np.ndarray (SIGNAL_LENGTH,)  — signal+noise window
-        "noise"       : np.ndarray  (variable)        — concatenated noise segments
-        "start"       : int         — detected start index in original signal
-        "end"         : int         — detected end index in original signal
-        "noise_floor" : float       — estimated noise floor RMS
-        "threshold"   : float       — actual threshold used
+    Extract active region and noise segment from a raw recording.
+    Automatically selects trial vs synthetic parameters based on signal length
+    or configuration if not explicitly provided.
+    Returns:
+        dict with keys:
+            'active': np.ndarray padded/truncated to target_length
+            'noise': np.ndarray concatenated segments outside active window
+            'start': int start index
+            'end': int end index
+            'noise_floor': float
+            'threshold': float
     """
-    rms = compute_rms_envelope(signal, window=cfg.EXTRACTION_RMS_WINDOW)
-    noise_floor = estimate_noise_floor(rms, percentile=cfg.EXTRACTION_NOISE_PERCENTILE)
-    start, end = detect_active_region(
-        rms,
-        noise_floor,
-        cfg.EXTRACTION_THRESHOLD_FACTOR,
-        cfg.EXTRACTION_PAD_SAMPLES,
-        len(signal),
-    )
+    signal = np.asarray(signal, dtype=np.float32)
+    sig_len = len(signal)
 
-    # --- Active region: pad/truncate to SIGNAL_LENGTH ---
-    raw_active = signal[start : end + 1].copy()
-    target = cfg.SIGNAL_LENGTH
-    if len(raw_active) >= target:
-        active = raw_active[:target]
+    # Determine parameter set (trial data is ~19.3k samples or sampled at 17.8 kHz)
+    is_trial = sig_len < 22000
+    rms_window = cfg.TRIAL_RMS_WINDOW if is_trial else cfg.EXTRACTION_RMS_WINDOW
+    pad_samples = cfg.TRIAL_PAD_SAMPLES if is_trial else cfg.EXTRACTION_PAD_SAMPLES
+    out_length = target_length or (cfg.TRIAL_SIGNAL_LENGTH if is_trial else cfg.SIGNAL_LENGTH)
+    threshold_factor = cfg.EXTRACTION_THRESHOLD_FACTOR
+    noise_percentile = cfg.EXTRACTION_NOISE_PERCENTILE
+
+    rms = compute_rms_envelope(signal, rms_window)
+    noise_floor = estimate_noise_floor(rms, noise_percentile)
+    threshold = noise_floor * threshold_factor
+    start, end = detect_active_region(rms, noise_floor, threshold_factor, pad_samples, sig_len)
+
+    active_raw = signal[start:end]
+    act_len = len(active_raw)
+
+    if act_len < out_length:
+        active = np.pad(active_raw, (0, out_length - act_len), mode="constant", constant_values=0.0)
+    elif act_len > out_length:
+        active = active_raw[:out_length]
     else:
-        active = np.pad(raw_active, (0, target - len(raw_active)), mode="constant")
+        active = active_raw
 
-    # --- Noise segments: actual silence before and after ---
+    # Concatenate inactive segments outside [start, end]
     noise_parts = []
     if start > 0:
         noise_parts.append(signal[:start])
-    if end < len(signal) - 1:
-        noise_parts.append(signal[end + 1:])
+    if end < sig_len:
+        noise_parts.append(signal[end:])
 
     if noise_parts:
-        noise = np.concatenate(noise_parts).astype(np.float32)
+        noise_seg = np.concatenate(noise_parts)
     else:
-        # Edge case: whole signal is "active"; fall back to low-energy window
-        noise = extract_noise_reference(signal, window_len=cfg.NOISE_REF_WINDOW)
+        noise_seg = signal.copy()
 
     return {
-        "active":      active.astype(np.float32),
-        "noise":       noise,
-        "start":       start,
-        "end":         end,
-        "noise_floor": noise_floor,
-        "threshold":   cfg.EXTRACTION_THRESHOLD_FACTOR * noise_floor,
+        "active": active.astype(np.float32),
+        "noise": noise_seg.astype(np.float32),
+        "start": start,
+        "end": end,
+        "noise_floor": float(noise_floor),
+        "threshold": float(threshold),
     }
 
 
-# --------------------------------------------------------------------------- #
-# Noise reference extraction  (legacy — used as fallback)
-# --------------------------------------------------------------------------- #
-
-def extract_noise_reference(
-    signal: np.ndarray,
-    window_len: int = 512,
-) -> np.ndarray:
+def extract_noise_reference(signal: np.ndarray, window_len: int) -> np.ndarray:
     """
-    Extract a noise-reference segment from a signal using the lowest-energy
-    sliding window.
-
-    This is used when there is NO guaranteed noise-only prefix in the trial
-    data.  The window with the minimum RMS energy is returned as the noise
-    reference.
-
-    Parameters
-    ----------
-    signal : np.ndarray
-        1-D float array, shape (N,).
-    window_len : int
-        Length of the sliding window in samples.
-
-    Returns
-    -------
-    np.ndarray
-        1-D float32 array, shape (window_len,), representing the noise
-        reference segment.
-
-    Raises
-    ------
-    ValueError
-        If the signal is shorter than ``window_len``.
+    Extract lowest-energy sliding window of length window_len in O(N) time.
+    Used as robust fallback when inactive regions are constrained.
     """
+    signal = np.asarray(signal, dtype=np.float32)
     n = len(signal)
-    if n < window_len:
-        raise ValueError(
-            f"[extract_noise_reference] Signal length ({n}) is shorter than "
-            f"the requested window ({window_len}).  Reduce NOISE_REF_WINDOW in Config."
-        )
+    if n <= window_len:
+        return np.pad(signal, (0, max(0, window_len - n)), mode="constant")
 
-    # Compute squared energy for each window using cumulative-sum trick (O(N)).
-    sig_sq = signal.astype(np.float64) ** 2
-    cum = np.cumsum(sig_sq)
-    # Energy of window starting at index i: cum[i+W-1] - (cum[i-1] if i>0 else 0)
-    starts = np.arange(n - window_len + 1)
-    energies = cum[starts + window_len - 1] - np.concatenate(([[0.0], cum[:-1]]))[starts]
-
-    best_start = int(np.argmin(energies))
-    return signal[best_start : best_start + window_len].astype(np.float32)
+    sq = (signal.astype(np.float64)) ** 2
+    cumsum = np.cumsum(np.concatenate(([0.0], sq)))
+    win_energy = cumsum[window_len:] - cumsum[:-window_len]
+    min_idx = int(np.argmin(win_energy))
+    return signal[min_idx: min_idx + window_len].astype(np.float32)
 
 
-# --------------------------------------------------------------------------- #
-# Normalisation
-# --------------------------------------------------------------------------- #
-
-def normalize_signal(
-    signal: np.ndarray,
-    eps: float = 1e-8,
-) -> Tuple[np.ndarray, float, float]:
+def normalize_signal(signal: np.ndarray, eps: float = 1e-8) -> Tuple[np.ndarray, float, float]:
     """
-    Z-score normalise a 1-D signal.
-
-    Parameters
-    ----------
-    signal : np.ndarray
-        1-D float array.
-    eps : float
-        Small constant to avoid division by zero.
-
-    Returns
-    -------
-    normalised : np.ndarray
-        Zero-mean, unit-variance signal.
-    mean : float
-        Original mean (for de-normalisation).
-    std : float
-        Original std (for de-normalisation).
+    Z-score normalize a 1-D signal: (x - mean) / (std + eps).
+    Returns (normalized_signal, mean, std).
     """
     mean = float(np.mean(signal))
-    std = float(np.std(signal)) + eps
-    return (signal - mean) / std, mean, std
+    std = float(np.std(signal))
+    norm = (signal - mean) / (std + eps)
+    return norm.astype(np.float32), mean, std
 
 
-def denormalize_signal(
-    signal: np.ndarray,
-    mean: float,
-    std: float,
-) -> np.ndarray:
-    """Reverse z-score normalisation."""
-    return signal * std + mean
-
-
-# --------------------------------------------------------------------------- #
-# Tensor helpers
-# --------------------------------------------------------------------------- #
-
-def to_tensor(array: np.ndarray):
+def denormalize_signal(normalized: Union[np.ndarray, torch.Tensor], mean: float, std: float) -> np.ndarray:
     """
-    Convert a 1-D numpy array to a (1, N) float32 PyTorch tensor suitable
-    for a 1-channel 1-D convolutional model.
-
-    Requires PyTorch.
+    Reverse z-score normalization: x * std + mean.
     """
-    import torch
-    arr = np.asarray(array, dtype=np.float32)
-    return torch.from_numpy(arr).unsqueeze(0)   # shape: (1, N)
+    if isinstance(normalized, torch.Tensor):
+        normalized = normalized.detach().cpu().squeeze().numpy()
+    return (normalized * std + mean).astype(np.float32)
 
 
-# --------------------------------------------------------------------------- #
-# Filesystem helpers
-# --------------------------------------------------------------------------- #
-
-def ensure_dir(path: str) -> None:
-    """Create ``path`` (and any missing parents) if it does not exist."""
-    os.makedirs(path, exist_ok=True)
+def to_tensor(signal: Union[np.ndarray, list], dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """
+    Convert 1-D numpy array or list to PyTorch 2-D tensor of shape (1, N).
+    """
+    arr = np.asarray(signal, dtype=np.float32)
+    t = torch.from_numpy(arr).to(dtype=dtype)
+    if t.ndim == 1:
+        t = t.unsqueeze(0)
+    return t

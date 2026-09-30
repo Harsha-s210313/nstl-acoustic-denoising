@@ -1,0 +1,20 @@
+# ==============================================================================
+# NSTL Acoustic Signal Detection & Denoising Pipeline Dependencies
+# Pinned dependencies for air-gapped / offline deployments and Jetson AGX Xavier.
+#
+# NOTE ON BUILDING AN OFFLINE WHEEL BUNDLE:
+# On an internet-connected host with the target OS and Python version, run:
+#   pip download -r requirements.txt -d ./wheelhouse
+# Then copy the 'wheelhouse' directory and this codebase onto CD/removable media.
+# On the air-gapped machine, install completely offline using:
+#   pip install --no-index --find-links=./wheelhouse -r requirements.txt
+# ==============================================================================
+
+torch==2.2.2
+numpy==1.26.4
+scipy==1.15.3
+
+# Optional dependencies (imported lazily or used in testing/visualization)
+matplotlib==3.10.9
+tqdm==4.70.0
+pytest==9.1.1

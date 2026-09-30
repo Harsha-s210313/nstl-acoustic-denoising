@@ -1,39 +1,33 @@
 """
-denoiser_pretrain.py
---------------------
-Lightweight entry-point for Stage 2A: Synthetic U-Net Pretraining.
-
-This file does NOT duplicate the training logic.
-All training is delegated to SyntheticDenoiserTrainer in denoiser_finetune.py,
-which is the CANONICAL implementation.
-
-Usage:
-    python denoiser_pretrain.py
-
-Equivalent to:
-    python denoiser_finetune.py --stage pretrain
-
-After pretraining completes, MANUALLY VERIFY the pretrained model before
-proceeding to Stage 2B (trial fine-tuning).
+Thin entry point for Stage 2A Supervised U-Net Pretraining.
+Calls SyntheticDenoiserTrainer from denoiser_finetune.py.
 """
 
-import logging
-import sys
+import argparse
+try:
+    from .config import Config
+    from .denoiser_finetune import SyntheticDenoiserTrainer
+except (ImportError, ValueError):
+    from config import Config
+    from denoiser_finetune import SyntheticDenoiserTrainer
 
-from config import Config
-from denoiser_finetune import SyntheticDenoiserTrainer
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-log = logging.getLogger(__name__)
+def main():
+    parser = argparse.ArgumentParser(description="Stage 2A U-Net Pretrainer")
+    parser.add_argument("--epochs", type=int, default=None, help="Epoch override")
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size override")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate override")
+    parser.add_argument("--device", type=str, default=None, help="Device override (cpu/cuda)")
+    args = parser.parse_args()
+
+    cfg = Config()
+    trainer = SyntheticDenoiserTrainer(cfg=cfg, device=args.device)
+    trainer.train(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+    )
 
 
 if __name__ == "__main__":
-    log.info("=== Stage 2A: Synthetic U-Net Pretraining ===")
-    log.info("(Canonical implementation: SyntheticDenoiserTrainer in denoiser_finetune.py)")
-    cfg = Config()
-    trainer = SyntheticDenoiserTrainer(cfg)
-    trainer.run()
+    main()

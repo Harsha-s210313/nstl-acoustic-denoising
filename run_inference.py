@@ -1,54 +1,61 @@
-# run_inference.py
-# ----------------
-# Open in IDLE and press F5.
-#
-# CURRENT SETUP:
-#   - SOURCE = "trial"
-#   - Uses PRETRAINED checkpoint (finetuned was deleted — trained with broken loss)
-#   - Points at your real trial file (channel001.dat)
-#   - Manual window: 0–200 ms  (the LFM signal is in this region)
-#     Adjust MANUAL_END_MS up/down if the signal looks cut off in the plot.
+"""
+IDLE F5 Wrapper for Inference.
+Run directly by pressing F5 in Python IDLE without any command line arguments.
+Evaluates default dataset according to config.INFERENCE_DEFAULT_SOURCE.
+"""
 
+import sys
 import os
-from config import Config
-from inference import run_inference
-from utils import set_seed
 
-# ================================================================
-# CONFIGURE HERE
-# ================================================================
+# Add package directory to sys.path for direct execution
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
 
-SOURCE = "trial"
+try:
+    from .config import Config
+    from .inference import run_pipeline
+except ImportError:
+    from config import Config
+    from inference import run_pipeline
 
-# Your real trial file
-EXPLICIT_FILE = r"C:\Users\HARSHA\Downloads\TransferNow-20260922dMEzqqdd\pri\channel001.dat"
 
-# Pretrained checkpoint (not the finetuned one — that had a broken loss)
-CHECKPOINT = r"models\unet_pretrained.pth"
+def run() -> None:
+    print("=" * 70)
+    print("Launching Acoustic Pipeline Inference (F5 IDLE Mode)...")
+    print("=" * 70)
+    cfg = Config()
 
-# Manual active window in milliseconds.
-# Auto-detection fails on this file because the background noise is bursty.
-# The LFM signal is visible in the 0–200 ms range.
-# Tweak MANUAL_END_MS if the denoised signal looks truncated.
-MANUAL_START_MS = 0.0     # ms
-MANUAL_END_MS   = 200.0   # ms — increase to 250 or 300 if signal is cut off
+    # Pretrained checkpoint provides robust supervised noise suppression
+    # Finetuned checkpoint applies unsupervised noise reference adaptation
+    model_choice = "pretrained"
+    if not os.path.isfile(cfg.UNET_PRETRAINED_CHECKPOINT) and os.path.isfile(cfg.UNET_FINETUNED_CHECKPOINT):
+        model_choice = "finetuned"
 
-# ================================================================
+    res = run_pipeline(
+        source=cfg.INFERENCE_DEFAULT_SOURCE,
+        pri=cfg.INFERENCE_TRIAL_PRI,
+        channel=cfg.INFERENCE_TRIAL_CHANNEL,
+        model_type=model_choice,
+        cfg=cfg,
+        show_plot=True,
+    )
+    print("\nInference Complete:")
+    print(f"  Input:            {res['input_path']}")
+    print(f"  Model Stage:      {model_choice}")
+    print(f"  Denoised Output:  {res['output_dat']}")
+    print(f"  Diagnostic Plot:  {res['output_plot']}")
+    print(f"  Detector:         {res['detector_verdict']}")
+    print(f"  SNR Improvement:  {res['snr_improvement']:+.2f} dB")
 
-cfg = Config()
-set_seed(cfg.RANDOM_SEED)
+    # Ensure plot opens on Windows
+    if res.get("output_plot") and os.path.isfile(res["output_plot"]):
+        if sys.platform.startswith("win"):
+            try:
+                os.startfile(res["output_plot"])
+            except Exception:
+                pass
 
-print(f"\n[run_inference] Source     : {SOURCE.upper()}")
-print(f"[run_inference] File       : {EXPLICIT_FILE}")
-print(f"[run_inference] Checkpoint : {CHECKPOINT}")
-print(f"[run_inference] Window     : {MANUAL_START_MS:.1f} - {MANUAL_END_MS:.1f} ms (manual)\n")
 
-run_inference(
-    cfg,
-    SOURCE,
-    CHECKPOINT,
-    EXPLICIT_FILE,
-    cfg.INFERENCE_OUTPUT_DIR,
-    manual_start_ms=MANUAL_START_MS,
-    manual_end_ms=MANUAL_END_MS,
-)
+if __name__ == "__main__":
+    run()

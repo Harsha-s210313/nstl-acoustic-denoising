@@ -1,478 +1,338 @@
 """
-dataset.py
-----------
-PyTorch Dataset implementations for the NSTL Acoustic Pipeline.
-
-Classes
--------
-DetectorDataset
-    Stage 1: binary classification dataset (signal-present vs. noise-only).
-
-UNetPretrainDataset
-    Stage 2A: paired clean/noisy synthetic LFM data for supervised denoising.
-
-NoiseAdaptationUNetDataset
-    Stage 2B: real trial data with automatically extracted noise references
-    for unsupervised fine-tuning.
+PyTorch Dataset implementations for:
+1. DetectorDataset: Supervised pulse detection (Signal=1, Noise=0).
+2. UNetPretrainDataset: Supervised pretraining on matched synthetic clean/noisy pairs.
+3. NoiseAdaptationUNetDataset: Unsupervised noise adaptation on trial data.
 """
 
 import os
+import glob
 import logging
-from typing import List, Optional, Tuple
-
+from typing import Tuple, List, Optional
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from config import Config
-from utils import load_dat_file, extract_noise_reference, extract_active_region, normalize_signal, to_tensor
-
-log = logging.getLogger(__name__)
-
-
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
-
-def _collect_dat_files(directory: str) -> List[str]:
-    """
-    Return a sorted list of absolute paths to all .dat files directly inside
-    ``directory`` (non-recursive, first level only).
-
-    Raises FileNotFoundError if the directory does not exist.
-    Raises ValueError if the directory contains no .dat files.
-    """
-    if not os.path.isdir(directory):
-        raise FileNotFoundError(
-            f"Directory not found: {directory!r}. "
-            "Check your Config paths and make sure the data is in place."
-        )
-    paths = sorted(
-        os.path.join(directory, f)
-        for f in os.listdir(directory)
-        if f.lower().endswith(".dat")
+try:
+    from .config import Config
+    from .utils import (
+        load_dat_file,
+        normalize_signal,
+        compute_rms_envelope,
+        estimate_noise_floor,
+        detect_active_region,
+        extract_noise_reference,
+        to_tensor,
     )
-    if not paths:
-        raise ValueError(f"No .dat files found in {directory!r}.")
-    return paths
+except (ImportError, ValueError):
+    from config import Config
+    from utils import (
+        load_dat_file,
+        normalize_signal,
+        compute_rms_envelope,
+        estimate_noise_floor,
+        detect_active_region,
+        extract_noise_reference,
+        to_tensor,
+    )
 
+logger = logging.getLogger(__name__)
 
-def _apply_augmentation(
-    noisy: np.ndarray,
-    clean: np.ndarray,
-    cfg: Config,
-    rng: np.random.Generator,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Apply on-the-fly domain randomisation to a (noisy, clean) pair.
-
-    All augmentation parameters come from ``cfg``; no magic numbers here.
-    The SAME transform is applied to both noisy and clean to preserve the
-    paired relationship.
-
-    Augmentations (all individually configurable):
-      1. Circular time-shift    — AUG_TIME_SHIFT_MAX
-      2. Amplitude jitter       — AUG_AMPLITUDE_JITTER
-      3. Additional white noise — AUG_NOISE_STD_MAX  (applied to noisy only)
-      4. Time reversal          — AUG_FLIP_PROB
-
-    Parameters
-    ----------
-    noisy, clean : np.ndarray
-        1-D float32 arrays of equal length.
-    cfg : Config
-        Configuration object.
-    rng : np.random.Generator
-        NumPy random generator (for reproducibility).
-
-    Returns
-    -------
-    (noisy_aug, clean_aug) : Tuple[np.ndarray, np.ndarray]
-    """
-    noisy = noisy.copy()
-    clean = clean.copy()
-
-    # 1. Circular time-shift (applied identically to both channels)
-    if cfg.AUG_TIME_SHIFT_MAX > 0:
-        shift = int(rng.integers(-cfg.AUG_TIME_SHIFT_MAX, cfg.AUG_TIME_SHIFT_MAX + 1))
-        if shift != 0:
-            noisy = np.roll(noisy, shift)
-            clean = np.roll(clean, shift)
-
-    # 2. Amplitude jitter (identical scale to both to preserve SNR relationship)
-    if cfg.AUG_AMPLITUDE_JITTER > 0.0:
-        scale = 1.0 + float(rng.uniform(-cfg.AUG_AMPLITUDE_JITTER, cfg.AUG_AMPLITUDE_JITTER))
-        noisy *= scale
-        clean *= scale
-
-    # 3. Additional synthetic noise (applied to noisy only — degrades the input,
-    #    not the target, which is the physically correct direction)
-    if cfg.AUG_NOISE_STD_MAX > 0.0:
-        std = float(rng.uniform(0.0, cfg.AUG_NOISE_STD_MAX))
-        if std > 0.0:
-            noisy = noisy + rng.normal(0.0, std, size=noisy.shape).astype(np.float32)
-
-    # 4. Time reversal
-    if cfg.AUG_FLIP_PROB > 0.0 and rng.random() < cfg.AUG_FLIP_PROB:
-        noisy = noisy[::-1].copy()
-        clean = clean[::-1].copy()
-
-    return noisy, clean
-
-
-# --------------------------------------------------------------------------- #
-# Stage 1: Detector dataset
-# --------------------------------------------------------------------------- #
 
 class DetectorDataset(Dataset):
     """
-    Binary classification dataset for Stage 1 (SignalDetectorCNN).
-
-    Directory layout::
-
-        DETECTOR_DATA_DIR/
-            signal/   *.dat   (label = 1)
-            noise/    *.dat   (label = 0)
-
-    Each .dat file is loaded, length-validated, and z-score normalised.
-
-    Parameters
-    ----------
-    cfg : Config
-        Configuration object.
-    split : str
-        One of "train" or "val".  The split is performed deterministically
-        using Config.RANDOM_SEED.
-    augment : bool
-        If True (train split only), apply light amplitude jitter.
+    Dataset for Stage 1 CNN Detector.
+    Loads signals from DETECTOR_DATA_DIR/signal (label 1) and DETECTOR_DATA_DIR/noise (label 0).
+    Applies independent z-score normalization and optional training jitter.
     """
 
-    def __init__(self, cfg: Config, split: str = "train", augment: bool = False):
-        if split not in ("train", "val"):
-            raise ValueError(f"split must be 'train' or 'val', got {split!r}")
-
+    def __init__(
+        self,
+        cfg: Config,
+        split: str = "train",
+        augment: bool = True,
+    ) -> None:
+        super().__init__()
         self.cfg = cfg
         self.split = split
-        self.augment = augment and split == "train"
-        self.rng = np.random.default_rng(cfg.RANDOM_SEED)
+        self.augment = augment and (split == "train") and cfg.AUG_ENABLED
 
-        signal_dir = os.path.join(cfg.DETECTOR_DATA_DIR, "signal")
+        sig_dir = os.path.join(cfg.DETECTOR_DATA_DIR, "signal")
+        if not os.path.isdir(sig_dir):
+            for alt in [
+                os.path.join(cfg.SYNTHETIC_DATA_DIR, "detector", "signal"),
+                os.path.join(cfg.SYNTHETIC_DATA_DIR, "signal"),
+            ]:
+                if os.path.isdir(alt):
+                    sig_dir = alt
+                    break
+
         noise_dir = os.path.join(cfg.DETECTOR_DATA_DIR, "noise")
+        if not os.path.isdir(noise_dir):
+            for alt in [
+                os.path.join(cfg.SYNTHETIC_DATA_DIR, "detector", "noise"),
+                os.path.join(cfg.SYNTHETIC_DATA_DIR, "noise"),
+            ]:
+                if os.path.isdir(alt):
+                    noise_dir = alt
+                    break
 
-        signal_files = _collect_dat_files(signal_dir)
-        noise_files = _collect_dat_files(noise_dir)
+        samples: List[Tuple[str, int]] = []
+        if os.path.isdir(sig_dir):
+            for f in sorted(glob.glob(os.path.join(sig_dir, "*.dat"))):
+                samples.append((f, 1))
+        if os.path.isdir(noise_dir):
+            for f in sorted(glob.glob(os.path.join(noise_dir, "*.dat"))):
+                samples.append((f, 0))
 
-        all_paths = [(p, 1) for p in signal_files] + [(p, 0) for p in noise_files]
+        if not samples:
+            logger.warning("No detector data found in %s", cfg.DETECTOR_DATA_DIR)
 
-        # Deterministic shuffle then split
-        rng_split = np.random.default_rng(cfg.RANDOM_SEED)
-        indices = rng_split.permutation(len(all_paths)).tolist()
-        split_idx = int(len(indices) * (1.0 - cfg.DETECTOR_VAL_SPLIT))
+        # Deterministic shuffle & split
+        rng = np.random.RandomState(cfg.RANDOM_SEED)
+        indices = np.arange(len(samples))
+        rng.shuffle(indices)
+
+        val_size = int(len(samples) * cfg.DETECTOR_VAL_SPLIT)
         if split == "train":
-            chosen = indices[:split_idx]
+            chosen_indices = indices[val_size:]
         else:
-            chosen = indices[split_idx:]
+            chosen_indices = indices[:val_size]
 
-        self.samples: List[Tuple[str, int]] = [all_paths[i] for i in chosen]
-        log.info("DetectorDataset[%s]: %d samples", split, len(self.samples))
+        self.samples = [samples[i] for i in chosen_indices]
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         path, label = self.samples[idx]
-        arr = load_dat_file(path, expected_length=self.cfg.SIGNAL_LENGTH)
-        arr, _, _ = normalize_signal(arr)
+        data = load_dat_file(path, expected_length=self.cfg.SIGNAL_LENGTH)
+        norm_data, _, _ = normalize_signal(data)
 
-        if self.augment and self.cfg.AUG_AMPLITUDE_JITTER > 0.0:
-            scale = 1.0 + float(
-                self.rng.uniform(-self.cfg.AUG_AMPLITUDE_JITTER, self.cfg.AUG_AMPLITUDE_JITTER)
+        if self.augment and self.cfg.AUG_AMPLITUDE_JITTER > 0:
+            jitter = np.random.uniform(
+                1.0 - self.cfg.AUG_AMPLITUDE_JITTER,
+                1.0 + self.cfg.AUG_AMPLITUDE_JITTER,
             )
-            arr = arr * scale
+            norm_data = norm_data * jitter
 
-        x = to_tensor(arr)                             # (1, SIGNAL_LENGTH)
+        x = to_tensor(norm_data, dtype=torch.float32)
         y = torch.tensor(label, dtype=torch.long)
         return x, y
 
 
-# --------------------------------------------------------------------------- #
-# Stage 2A: Synthetic pretraining dataset
-# --------------------------------------------------------------------------- #
-
 class UNetPretrainDataset(Dataset):
     """
-    Paired clean/noisy dataset for Stage 2A supervised U-Net pretraining.
-
-    Directory layout (configured in Config)::
-
-        SYNTHETIC_DATA_DIR/
-            clean/  sig_001.dat  sig_002.dat  ...
-            noisy/  sig_001.dat  sig_002.dat  ...
-
-    Files are matched by IDENTICAL FILENAME across the two sub-directories.
-
-    Each sample is z-score normalised INDEPENDENTLY (i.e., the clean and
-    noisy signals are each normalised with their own statistics).  During
-    real inference the normalisation must therefore be applied in the same
-    per-sample manner.
-
-    On-the-fly data augmentation is applied during training if
-    ``Config.AUG_ENABLED`` is True.  All augmentation parameters come from
-    Config; none are hard-coded here.
-
-    Parameters
-    ----------
-    cfg : Config
-        Configuration object.
-    split : str
-        "train" or "val".
-    augment : bool
-        If True, apply on-the-fly augmentation (only effective during training).
+    Dataset for Stage 2A Supervised U-Net pretraining.
+    Pairs clean and noisy recordings by identical filename.
+    Applies independent z-score normalization and on-the-fly pair augmentations.
     """
 
-    def __init__(self, cfg: Config, split: str = "train", augment: bool = False):
-        if split not in ("train", "val"):
-            raise ValueError(f"split must be 'train' or 'val', got {split!r}")
-
+    def __init__(
+        self,
+        cfg: Config,
+        split: str = "train",
+        augment: bool = True,
+    ) -> None:
+        super().__init__()
         self.cfg = cfg
         self.split = split
-        self.augment = augment and split == "train" and cfg.AUG_ENABLED
-        self.rng = np.random.default_rng(cfg.RANDOM_SEED)
+        self.augment = augment and (split == "train") and cfg.AUG_ENABLED
 
         clean_dir = os.path.join(cfg.SYNTHETIC_DATA_DIR, cfg.SYNTHETIC_CLEAN_SUBDIR)
+        if not os.path.isdir(clean_dir):
+            for alt in [
+                os.path.join(cfg.SYNTHETIC_DATA_DIR, "synthetic", "clean"),
+                os.path.join(cfg.SYNTHETIC_DATA_DIR, "clean"),
+            ]:
+                if os.path.isdir(alt):
+                    clean_dir = alt
+                    break
+
         noisy_dir = os.path.join(cfg.SYNTHETIC_DATA_DIR, cfg.SYNTHETIC_NOISY_SUBDIR)
+        if not os.path.isdir(noisy_dir):
+            for alt in [
+                os.path.join(cfg.SYNTHETIC_DATA_DIR, "synthetic", "noisy"),
+                os.path.join(cfg.SYNTHETIC_DATA_DIR, "noisy"),
+            ]:
+                if os.path.isdir(alt):
+                    noisy_dir = alt
+                    break
 
-        # Build matched pairs by filename intersection
-        clean_files = {os.path.basename(p): p for p in _collect_dat_files(clean_dir)}
-        noisy_files = {os.path.basename(p): p for p in _collect_dat_files(noisy_dir)}
+        clean_files = {
+            os.path.basename(p): p
+            for p in glob.glob(os.path.join(clean_dir, "*.dat"))
+        }
+        noisy_files = {
+            os.path.basename(p): p
+            for p in glob.glob(os.path.join(noisy_dir, "*.dat"))
+        }
 
-        common = sorted(set(clean_files.keys()) & set(noisy_files.keys()))
-        if not common:
-            raise ValueError(
-                f"No filename overlap between {clean_dir!r} and {noisy_dir!r}. "
-                "Check that clean/ and noisy/ contain identically named .dat files."
-            )
+        common_keys = sorted(list(set(clean_files.keys()) & set(noisy_files.keys())))
+        unmatched_clean = set(clean_files.keys()) - set(noisy_files.keys())
+        unmatched_noisy = set(noisy_files.keys()) - set(clean_files.keys())
 
-        only_clean = set(clean_files.keys()) - set(noisy_files.keys())
-        only_noisy = set(noisy_files.keys()) - set(clean_files.keys())
-        if only_clean:
-            log.warning(
-                "%d clean files have no matching noisy counterpart (skipped): %s",
-                len(only_clean), sorted(only_clean)[:5],
-            )
-        if only_noisy:
-            log.warning(
-                "%d noisy files have no matching clean counterpart (skipped): %s",
-                len(only_noisy), sorted(only_noisy)[:5],
-            )
+        if unmatched_clean:
+            logger.warning("UNetPretrainDataset: %d unmatched clean files", len(unmatched_clean))
+        if unmatched_noisy:
+            logger.warning("UNetPretrainDataset: %d unmatched noisy files", len(unmatched_noisy))
 
-        all_pairs = [(clean_files[f], noisy_files[f]) for f in common]
+        pairs = [(noisy_files[k], clean_files[k]) for k in common_keys]
 
-        # Deterministic split
-        rng_split = np.random.default_rng(cfg.RANDOM_SEED)
-        indices = rng_split.permutation(len(all_pairs)).tolist()
-        split_idx = max(1, int(len(indices) * (1.0 - cfg.PRETRAIN_VAL_SPLIT)))
+        # Deterministic shuffle & split
+        rng = np.random.RandomState(cfg.RANDOM_SEED)
+        indices = np.arange(len(pairs))
+        rng.shuffle(indices)
+
+        val_size = int(len(pairs) * cfg.PRETRAIN_VAL_SPLIT)
         if split == "train":
-            chosen = indices[:split_idx]
+            chosen_indices = indices[val_size:]
         else:
-            chosen = indices[split_idx:]
-            if not chosen:
-                log.warning(
-                    "Validation split produced 0 samples (only %d pairs total). "
-                    "Increase your dataset or reduce PRETRAIN_VAL_SPLIT.",
-                    len(all_pairs),
-                )
+            chosen_indices = indices[:val_size]
 
-        self.pairs: List[Tuple[str, str]] = [all_pairs[i] for i in chosen]
-        log.info(
-            "UNetPretrainDataset[%s]: %d pairs (AUG=%s)",
-            split, len(self.pairs), self.augment,
-        )
+        self.pairs = [pairs[i] for i in chosen_indices]
 
     def __len__(self) -> int:
         return len(self.pairs)
 
-    def __getitem__(self, idx: int):
-        clean_path, noisy_path = self.pairs[idx]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        noisy_path, clean_path = self.pairs[idx]
 
-        clean = load_dat_file(clean_path, expected_length=self.cfg.SIGNAL_LENGTH)
         noisy = load_dat_file(noisy_path, expected_length=self.cfg.SIGNAL_LENGTH)
+        clean = load_dat_file(clean_path, expected_length=self.cfg.SIGNAL_LENGTH)
 
-        # Z-score normalise each signal independently
-        clean, _, _ = normalize_signal(clean)
+        # Independent normalization
         noisy, _, _ = normalize_signal(noisy)
+        clean, _, _ = normalize_signal(clean)
 
+        # Augmentation on-the-fly (train only)
         if self.augment:
-            noisy, clean = _apply_augmentation(noisy, clean, self.cfg, self.rng)
+            # 1. Circular time shift applied identically to both
+            if self.cfg.AUG_TIME_SHIFT_MAX > 0:
+                shift = int(np.random.randint(-self.cfg.AUG_TIME_SHIFT_MAX, self.cfg.AUG_TIME_SHIFT_MAX + 1))
+                noisy = np.roll(noisy, shift)
+                clean = np.roll(clean, shift)
 
-        noisy_t = to_tensor(noisy)   # (1, SIGNAL_LENGTH)
-        clean_t = to_tensor(clean)   # (1, SIGNAL_LENGTH)
-        return noisy_t, clean_t
+            # 2. Amplitude scale applied identically to both
+            if self.cfg.AUG_AMPLITUDE_JITTER > 0:
+                scale = float(np.random.uniform(
+                    1.0 - self.cfg.AUG_AMPLITUDE_JITTER,
+                    1.0 + self.cfg.AUG_AMPLITUDE_JITTER,
+                ))
+                noisy = noisy * scale
+                clean = clean * scale
 
+            # 3. Extra additive white noise on noisy only
+            if self.cfg.AUG_NOISE_STD_MAX > 0:
+                noise_std = float(np.random.uniform(0.0, self.cfg.AUG_NOISE_STD_MAX))
+                noisy = noisy + np.random.normal(0.0, noise_std, size=noisy.shape).astype(np.float32)
 
-# --------------------------------------------------------------------------- #
-# Stage 2B: Trial fine-tuning dataset
-# --------------------------------------------------------------------------- #
+            # 4. Optional time reversal applied identically to both
+            if self.cfg.AUG_FLIP_PROB > 0 and np.random.random() < self.cfg.AUG_FLIP_PROB:
+                noisy = np.flip(noisy).copy()
+                clean = np.flip(clean).copy()
+
+        return to_tensor(noisy, dtype=torch.float32), to_tensor(clean, dtype=torch.float32)
+
 
 class NoiseAdaptationUNetDataset(Dataset):
     """
-    Real trial data loader for Stage 2B unsupervised U-Net fine-tuning.
-
-    There is NO paired clean ground truth.  The dataset returns:
-        (noisy_signal, noise_profile)
-
-    where ``noise_profile`` is estimated from the signal itself by finding
-    the lowest-energy window of length ``Config.NOISE_REF_WINDOW``.  This
-    profile is consumed by ``UnsupervisedNoiseSuppressionLoss``.
-
-    Directory layout::
-
-        TRIAL_DATA_DIR/
-            signal/
-                pri01/  channel0.dat  channel1.dat  ...
-                pri02/  channel0.dat  ...
-            noise/
-                pri04/  channel0.dat  ...
-
-    Both signal/ and noise/ files are used as training data (the model
-    should suppress noise in all of them, whether or not a signal is truly
-    present).  PRIs are exclusive across the two subdirs.
-
-    Parameters
-    ----------
-    cfg : Config
-        Configuration object.
-    subset : str
-        One of "signal", "noise", or "all" (default).
-        Controls which sub-directory tree is loaded.
+    Dataset for Stage 2B Unsupervised Noise Adaptation on real trial recordings.
+    Scans PRI/channel folders, extracts active pulse window and an inactive noise reference.
+    Normalizes noise reference using the active window's mean and std.
     """
 
-    def __init__(self, cfg: Config, subset: str = "all"):
-        if subset not in ("signal", "noise", "all"):
-            raise ValueError(f"subset must be 'signal', 'noise', or 'all', got {subset!r}")
-
+    def __init__(
+        self,
+        cfg: Config,
+        subset: str = "all",
+    ) -> None:
+        super().__init__()
         self.cfg = cfg
         self.subset = subset
+
+        search_dirs = []
+        if cfg.TRIAL_SIGNAL_SUBDIR:
+            sig_path = (
+                cfg.TRIAL_SIGNAL_SUBDIR
+                if os.path.isabs(cfg.TRIAL_SIGNAL_SUBDIR)
+                else os.path.join(cfg.TRIAL_DATA_DIR, cfg.TRIAL_SIGNAL_SUBDIR)
+            )
+            if os.path.isdir(sig_path) and subset in ("all", "signal"):
+                search_dirs.append(sig_path)
+
+        if cfg.TRIAL_NOISE_SUBDIR:
+            noise_path = (
+                cfg.TRIAL_NOISE_SUBDIR
+                if os.path.isabs(cfg.TRIAL_NOISE_SUBDIR)
+                else os.path.join(cfg.TRIAL_DATA_DIR, cfg.TRIAL_NOISE_SUBDIR)
+            )
+            if os.path.isdir(noise_path) and subset in ("all", "noise"):
+                search_dirs.append(noise_path)
+
+        if not search_dirs and os.path.isdir(cfg.TRIAL_DATA_DIR):
+            search_dirs.append(cfg.TRIAL_DATA_DIR)
+
         self.files: List[str] = []
+        for s_dir in search_dirs:
+            # Recursive scan for PRI_xx/channel*.dat or any *.dat
+            matches = glob.glob(os.path.join(s_dir, "**", "*.dat"), recursive=True)
+            self.files.extend(matches)
 
-        signal_root = os.path.join(cfg.TRIAL_DATA_DIR, cfg.TRIAL_SIGNAL_SUBDIR) \
-            if not os.path.isabs(cfg.TRIAL_SIGNAL_SUBDIR) \
-            else cfg.TRIAL_SIGNAL_SUBDIR
-
-        noise_root = os.path.join(cfg.TRIAL_DATA_DIR, cfg.TRIAL_NOISE_SUBDIR) \
-            if not os.path.isabs(cfg.TRIAL_NOISE_SUBDIR) \
-            else cfg.TRIAL_NOISE_SUBDIR
-
-        if subset in ("signal", "all"):
-            self.files.extend(self._scan_pri_tree(signal_root))
-        if subset in ("noise", "all"):
-            # Noise folder is optional — noise reference is now extracted
-            # from inside each signal file via extract_active_region().
-            if os.path.isdir(noise_root):
-                self.files.extend(self._scan_pri_tree(noise_root))
-            else:
-                log.warning(
-                    "Noise directory not found: %r — skipping. "
-                    "Noise reference will be extracted from signal files.",
-                    noise_root,
-                )
-
+        self.files = sorted(list(set(self.files)))
         if not self.files:
-            raise ValueError(
-                f"NoiseAdaptationUNetDataset: No .dat files found under "
-                f"{cfg.TRIAL_DATA_DIR!r} (subset={subset!r}). "
-                "Populate the trial data directories before fine-tuning."
-            )
-
-        log.info(
-            "NoiseAdaptationUNetDataset[%s]: %d files",
-            subset, len(self.files),
-        )
-
-    @staticmethod
-    def _scan_pri_tree(root: str) -> List[str]:
-        """
-        Recursively collect all .dat files under ``root``.
-
-        Expected structure: root/priXX/channelY.dat
-        """
-        if not os.path.isdir(root):
-            raise FileNotFoundError(
-                f"Trial data directory not found: {root!r}. "
-                "Check Config.TRIAL_DATA_DIR and its sub-directories."
-            )
-        collected = []
-        for pri in sorted(os.listdir(root)):
-            pri_path = os.path.join(root, pri)
-            if not os.path.isdir(pri_path):
-                continue
-            for fname in sorted(os.listdir(pri_path)):
-                if fname.lower().endswith(".dat"):
-                    collected.append(os.path.join(pri_path, fname))
-        return collected
+            logger.warning("No trial .dat files found across: %s", search_dirs)
 
     def __len__(self) -> int:
         return len(self.files)
 
-    def __getitem__(self, idx: int):
-        path = self.files[idx]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        file_path = self.files[idx]
+        raw_signal = load_dat_file(file_path)
+        sig_len = len(raw_signal)
 
-        # Load full trial recording at actual file length (no truncation warnings).
-        signal = load_dat_file(path)
-
-        # ------------------------------------------------------------------ #
-        # Active-region extraction using TRIAL-specific params (17.8 kHz)
-        #
-        # The synthetic EXTRACTION_* params are for 100 kHz and would fail here:
-        #   RMS_WINDOW=1000 → 56ms at 17.8 kHz (too coarse for 113ms pulse)
-        #   PAD_SAMPLES=5000 → 281ms at 17.8 kHz (would cover most of the file)
-        #
-        # TRIAL_RMS_WINDOW=178  →  10ms at 17.8 kHz  ✓
-        # TRIAL_PAD_SAMPLES=890 →  50ms at 17.8 kHz  ✓
-        # ------------------------------------------------------------------ #
-        from utils import compute_rms_envelope, estimate_noise_floor, detect_active_region
-
-        rms         = compute_rms_envelope(signal, self.cfg.TRIAL_RMS_WINDOW)
+        # 1. Compute RMS envelope and noise floor
+        rms = compute_rms_envelope(raw_signal, self.cfg.TRIAL_RMS_WINDOW)
         noise_floor = estimate_noise_floor(rms, self.cfg.EXTRACTION_NOISE_PERCENTILE)
-        start, end  = detect_active_region(
-            rms, noise_floor,
+
+        # 2. Detect active pulse region
+        start, end = detect_active_region(
+            rms,
+            noise_floor,
             self.cfg.EXTRACTION_THRESHOLD_FACTOR,
             self.cfg.TRIAL_PAD_SAMPLES,
-            len(signal),
+            sig_len,
         )
 
-        # Slice detected window and pad/truncate to TRIAL_SIGNAL_LENGTH
-        window     = signal[start : end + 1]
+        # 3. Extract active window padded/truncated to TRIAL_SIGNAL_LENGTH
+        act_slice = raw_signal[start:end]
         target_len = self.cfg.TRIAL_SIGNAL_LENGTH
-        if len(window) >= target_len:
-            active = window[:target_len].copy()
+        if len(act_slice) < target_len:
+            active_window = np.pad(act_slice, (0, target_len - len(act_slice)), mode="constant")
         else:
-            active = np.pad(window, (0, target_len - len(window)), mode="constant")
+            active_window = act_slice[:target_len]
 
-        # Noise reference: take a segment from the silence BEFORE the active window.
-        # If there isn't enough silence before, take from after.
-        W = self.cfg.TRIAL_NOISE_REF_WINDOW   # 20ms at 17.8 kHz = 356 samples
-        if start >= W:
-            # Take noise from right before the active window
-            noise_raw = signal[start - W : start].astype(np.float32)
-        elif len(signal) - end - 1 >= W:
-            # Take noise from right after the active window
-            noise_raw = signal[end + 1 : end + 1 + W].astype(np.float32)
+        # 4. Extract TRIAL_NOISE_REF_WINDOW reference (prefer immediately before, then after, then fallback)
+        w_ref = self.cfg.TRIAL_NOISE_REF_WINDOW
+        if start >= w_ref:
+            noise_ref = raw_signal[start - w_ref: start]
+        elif end + w_ref <= sig_len:
+            noise_ref = raw_signal[end: end + w_ref]
+        elif sig_len >= w_ref:
+            noise_ref = raw_signal[:w_ref]
         else:
-            # Fallback: use the first W samples (may include some signal edge)
-            noise_raw = signal[:W].astype(np.float32)
+            noise_ref = extract_noise_reference(raw_signal, w_ref)
 
-        # Z-score normalise (use the same stats for both, derived from active)
-        active, act_mean, act_std = normalize_signal(active)
-
-        # Normalise noise ref with the same stats so it's on the same scale
-        if act_std > 1e-8:
-            noise_ref = (noise_raw - act_mean) / act_std
+        if len(noise_ref) < w_ref:
+            noise_ref = np.pad(noise_ref, (0, w_ref - len(noise_ref)), mode="constant")
         else:
-            noise_ref = noise_raw
+            noise_ref = noise_ref[:w_ref]
 
-        signal_t = to_tensor(active)                        # (1, TRIAL_SIGNAL_LENGTH)
-        noise_t  = to_tensor(noise_ref.astype(np.float32)) # (1, TRIAL_NOISE_REF_WINDOW)
-        return signal_t, noise_t
+        # 5. Shared normalization: normalize active window, and scale noise reference with identical mean and std
+        norm_active, mean, std = normalize_signal(active_window)
+        norm_noise_ref = (noise_ref - mean) / (std + 1e-8)
 
+        x_active = to_tensor(norm_active, dtype=torch.float32)
+        x_noise_ref = to_tensor(norm_noise_ref, dtype=torch.float32)
 
+        return x_active, x_noise_ref

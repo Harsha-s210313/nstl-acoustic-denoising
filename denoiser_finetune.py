@@ -1,591 +1,411 @@
 """
-denoiser_finetune.py
---------------------
-Canonical Stage 2 training implementation.
-
-Contains TWO classes:
-  SyntheticDenoiserTrainer  — Stage 2A supervised pretraining on synthetic pairs
-  TrialDataFineTuner        — Stage 2B unsupervised fine-tuning on real trial data
-
-Entry-point (--stage argument required):
-  python denoiser_finetune.py --stage pretrain     # runs Stage 2A
-  python denoiser_finetune.py --stage finetune     # runs Stage 2B
-
-If --stage is omitted the script defaults to the SAFER action (pretrain)
-and prints a reminder that manual verification is expected before fine-tuning.
-
-Workflow safety
----------------
-The intended workflow is:
-    Stage 2A pretrain  →  MANUAL VERIFICATION  →  Stage 2B finetune
-
-This file enforces that:
-  - Fine-tuning will not run without --stage finetune being explicitly given.
-  - Fine-tuning requires the pretrained checkpoint to exist; it will refuse
-    to start from scratch with an untrained model.
+Canonical implementation of Stage 2 Denoising:
+- UnsupervisedNoiseSuppressionLoss: Physically grounded energy matching loss
+- SyntheticDenoiserTrainer: Stage 2A Supervised MSE pretraining on synthetic clean/noisy pairs
+- TrialDataFineTuner: Stage 2B Unsupervised noise-reference fine-tuning on real trial data
 """
 
-import argparse
-import logging
 import os
 import sys
-from typing import Optional
-
+import time
+import argparse
+import logging
+from typing import Dict, Any, Optional
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from config import Config
-from dataset import UNetPretrainDataset, NoiseAdaptationUNetDataset
-from unet import Configurable1DUNet
-from utils import ensure_dir, set_seed
+try:
+    from .config import Config, default_config
+    from .utils import set_seed, ensure_dir
+    from .dataset import UNetPretrainDataset, NoiseAdaptationUNetDataset
+    from .unet import Configurable1DUNet
+except (ImportError, ValueError):
+    from config import Config, default_config
+    from utils import set_seed, ensure_dir
+    from dataset import UNetPretrainDataset, NoiseAdaptationUNetDataset
+    from unet import Configurable1DUNet
 
-# ------------------------------------------------------------------ #
-# Logging
-# ------------------------------------------------------------------ #
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
-
-# --------------------------------------------------------------------------- #
-# Unsupervised noise-suppression loss
-# --------------------------------------------------------------------------- #
 
 class UnsupervisedNoiseSuppressionLoss(nn.Module):
     """
-    Unsupervised loss for fine-tuning the denoiser on real trial data.
+    Unsupervised loss driven by acoustic energy balance:
+      noisy_power = mean(noisy^2)
+      noise_power = mean(noise_ref^2)
+      signal_power = mean(denoised^2)
+      target_power = clamp(noisy_power - noise_power, min=1e-8)
+      loss_energy = mean((signal_power - target_power)^2)
+      loss_smooth = mean((denoised[t+1] - denoised[t])^2)
+      loss_over   = mean(clamp(noise_power - signal_power, min=0))
+      total = lam * loss_energy + (1 - lam) * loss_smooth + 0.1 * loss_over
 
-    Three terms:
-
-    1. **Energy matching** (primary term):
-       The expected clean signal power ≈ noisy_power − noise_power.
-       We penalise the denoised output for deviating from this target energy.
-
-         target_power = clamp(E[noisy²] − E[noise_ref²],  min=ε)
-         loss_energy  = E[(E[denoised²] − target_power)²]
-
-       This directly guides the model: remove the noise energy, keep the signal.
-       (Previous version used mean((denoised-noisy)²) which is minimised at
-        denoised=noisy — i.e., the identity / zero-denoising solution. Fixed.)
-
-    2. **Spectral smoothness** (regularisation):
-       Penalise high-frequency energy in the output.  LFM signals are smooth;
-       residual noise is rough.
-
-         loss_smooth = E[(denoised[t+1] − denoised[t])²]
-
-    3. **Over-suppression guard**:
-       If denoised power drops below the noise floor the model is erasing signal.
-       Soft penalty to prevent this.
-
-         loss_over = E[clamp(noise_power − signal_power,  min=0)]
-
-    Total = lam × loss_energy + (1−lam) × loss_smooth + 0.1 × loss_over
-
-    Parameters
-    ----------
-    lam : float
-        Weight on energy-matching term.  0.7 recommended:
-        70 % energy matching + 30 % smoothness.
-        (Previous default was 1.0, which zeroed out the smooth term entirely.)
+    Guaranteed properties:
+    - NOT minimized by identity (denoised == noisy produces non-zero loss when noise_ref is present).
+    - NOT minimized by all-zeros silence (signal_power == 0 incurs penalty from both target_power and loss_over).
     """
 
-    def __init__(self, lam: float = 0.7):
+    def __init__(self, lam: float = 0.7) -> None:
         super().__init__()
-        self.lam = lam
+        self.lam = float(lam)
 
     def forward(
         self,
         denoised: torch.Tensor,
         noisy: torch.Tensor,
-        noise_profile: torch.Tensor,
+        noise_ref: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        denoised      : (B, 1, L)  — U-Net output
-        noisy         : (B, 1, L)  — normalised trial input
-        noise_profile : (B, 1, W)  — noise reference segment from quiet region
+        # Per-sample power estimates averaged over the time dimension (dim=-1)
+        noisy_power = torch.mean(noisy ** 2, dim=-1, keepdim=True)
+        noise_power = torch.mean(noise_ref ** 2, dim=-1, keepdim=True)
+        signal_power = torch.mean(denoised ** 2, dim=-1, keepdim=True)
 
-        Returns
-        -------
-        torch.Tensor : scalar loss
-        """
-        # Per-sample power estimates  →  (B, 1, 1)
-        noisy_power  = torch.mean(noisy         ** 2, dim=-1, keepdim=True)
-        noise_power  = torch.mean(noise_profile ** 2, dim=-1, keepdim=True)
-        signal_power = torch.mean(denoised      ** 2, dim=-1, keepdim=True)
-
-        # Term 1: Energy matching
-        # Target = noisy_power − noise_power  (what the clean signal power should be)
-        # Clamp to ε so target is never negative (noise > noisy only in edge cases)
         target_power = torch.clamp(noisy_power - noise_power, min=1e-8)
-        loss_energy  = torch.mean((signal_power - target_power) ** 2)
+        loss_energy = torch.mean((signal_power - target_power) ** 2)
 
-        # Term 2: Spectral smoothness — penalise high-frequency noise in output
-        grad = denoised[:, :, 1:] - denoised[:, :, :-1]   # finite differences
-        loss_smooth = torch.mean(grad ** 2)
+        # Smoothness penalty against high-frequency residual jitter
+        diff = denoised[..., 1:] - denoised[..., :-1]
+        loss_smooth = torch.mean(diff ** 2)
 
-        # Term 3: Over-suppression guard
-        # Penalise if denoised power < noise floor (model is erasing the signal)
-        over_suppress      = torch.clamp(noise_power - signal_power, min=0.0)
-        loss_over_suppress = torch.mean(over_suppress)
+        # Penalty against over-suppression below background noise floor
+        loss_over = torch.mean(torch.clamp(noise_power - signal_power, min=0.0))
 
-        total = (self.lam * loss_energy
-                 + (1.0 - self.lam) * loss_smooth
-                 + 0.1 * loss_over_suppress)
-        return total
-
-
-# --------------------------------------------------------------------------- #
-# Checkpoint utilities
-# --------------------------------------------------------------------------- #
-
-def _save_checkpoint(
-    path: str,
-    model: nn.Module,
-    epoch: int,
-    val_loss: float,
-    cfg: Config,
-    tag: str,
-) -> None:
-    """Save a model checkpoint with enough metadata to detect mismatches."""
-    ensure_dir(os.path.dirname(path) or ".")
-    torch.save(
-        {
-            "tag": tag,
-            "epoch": epoch,
-            "val_loss": val_loss,
-            "model_state_dict": model.state_dict(),
-            "unet_config": cfg.UNET_CONFIG,
-            "signal_length": cfg.SIGNAL_LENGTH,
-        },
-        path,
-    )
-
-
-def _load_checkpoint(
-    path: str,
-    model: nn.Module,
-    cfg: Config,
-    strict: bool = True,
-) -> dict:
-    """
-    Load a checkpoint, validate configuration against the current Config,
-    and populate the model's state_dict.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the checkpoint file does not exist.
-    RuntimeError
-        If the stored UNET_CONFIG or signal_length mismatches the current Config.
-    """
-    if not os.path.isfile(path):
-        raise FileNotFoundError(
-            f"Checkpoint not found: {path!r}. "
-            "Run the pretraining stage first: python denoiser_finetune.py --stage pretrain"
+        total_loss = (
+            self.lam * loss_energy
+            + (1.0 - self.lam) * loss_smooth
+            + 0.1 * loss_over
         )
+        return total_loss
 
-    ckpt = torch.load(path, map_location="cpu")
-
-    # Validate configuration consistency
-    stored_cfg = ckpt.get("unet_config")
-    if stored_cfg is not None:
-        if stored_cfg.get("features") != cfg.UNET_CONFIG.get("features"):
-            raise RuntimeError(
-                f"Checkpoint feature widths {stored_cfg.get('features')} do not "
-                f"match current UNET_CONFIG features {cfg.UNET_CONFIG.get('features')}. "
-                "Update Config.UNET_CONFIG to match the checkpoint or retrain."
-            )
-    stored_len = ckpt.get("signal_length")
-    if stored_len is not None and stored_len != cfg.SIGNAL_LENGTH:
-        log.warning(
-            "Checkpoint SIGNAL_LENGTH=%d differs from Config.SIGNAL_LENGTH=%d. "
-            "This is fine — the U-Net is fully convolutional and its weights are "
-            "valid for any input length. Fine-tuning will adapt to the new length.",
-            stored_len, cfg.SIGNAL_LENGTH,
-        )
-
-    model.load_state_dict(ckpt["model_state_dict"], strict=strict)
-    log.info(
-        "Loaded checkpoint %r (tag=%r, epoch=%d, val_loss=%.6f)",
-        path,
-        ckpt.get("tag", "unknown"),
-        ckpt.get("epoch", -1),
-        ckpt.get("val_loss", float("nan")),
-    )
-    return ckpt
-
-
-# --------------------------------------------------------------------------- #
-# Stage 2A: Synthetic pretraining
-# --------------------------------------------------------------------------- #
 
 class SyntheticDenoiserTrainer:
     """
-    Stage 2A: Supervised U-Net pretraining on synthetic clean/noisy pairs.
-
-    Uses MSE loss.  Saves a checkpoint to Config.UNET_PRETRAINED_CHECKPOINT.
-
-    Parameters
-    ----------
-    cfg : Config
-        Configuration object (single source of truth).
+    Stage 2A: Supervised Pretraining on paired synthetic clean/noisy hydrophone signals.
+    Minimizes MSE against ground-truth clean signals.
     """
 
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        set_seed(cfg.RANDOM_SEED, cfg.DETERMINISTIC)
-        ensure_dir(cfg.MODELS_DIR)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        log.info("[SyntheticDenoiserTrainer] Device: %s", self.device)
+    def __init__(
+        self,
+        cfg: Optional[Config] = None,
+        device: Optional[str] = None,
+    ) -> None:
+        self.cfg = cfg or default_config
+        self.cfg.validate()
+        set_seed(self.cfg.RANDOM_SEED, self.cfg.DETERMINISTIC)
 
-    def run(self) -> None:
-        """Execute Stage 2A pretraining."""
-        cfg = self.cfg
+        dev_str = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(dev_str)
+        logger.info("Stage 2A Trainer initialized on device: %s", self.device)
 
-        # ------------------------------------------------------------------ #
-        # Datasets
-        # ------------------------------------------------------------------ #
-        log.info(
-            "Loading synthetic dataset from: %s (SYNTHETIC_IS_COMPLEX=%s)",
-            cfg.SYNTHETIC_DATA_DIR, cfg.SYNTHETIC_IS_COMPLEX,
-        )
-        train_ds = UNetPretrainDataset(cfg, split="train", augment=True)
-        val_ds = UNetPretrainDataset(cfg, split="val", augment=False)
+        self.model = Configurable1DUNet(cfg=self.cfg).to(self.device)
+
+    def train(
+        self,
+        epochs: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        lr: Optional[float] = None,
+        patience: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        num_epochs = epochs if epochs is not None else self.cfg.PRETRAIN_EPOCHS
+        b_size = batch_size if batch_size is not None else self.cfg.PRETRAIN_BATCH_SIZE
+        learning_rate = lr if lr is not None else self.cfg.PRETRAIN_LR
+        early_patience = patience if patience is not None else self.cfg.PRETRAIN_PATIENCE
+
+        train_ds = UNetPretrainDataset(self.cfg, split="train", augment=True)
+        val_ds = UNetPretrainDataset(self.cfg, split="val", augment=False)
 
         if len(train_ds) == 0:
             raise RuntimeError(
-                "Synthetic training set is empty.  Populate "
-                f"{cfg.SYNTHETIC_DATA_DIR}/clean and .../noisy with matched .dat files."
+                f"Synthetic clean/noisy dataset is empty in {self.cfg.SYNTHETIC_DATA_DIR}. "
+                "Run generate_trial_data.py first."
             )
 
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=cfg.PRETRAIN_BATCH_SIZE,
-            shuffle=True,
-            drop_last=False,
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=cfg.PRETRAIN_BATCH_SIZE,
-            shuffle=False,
-        ) if len(val_ds) > 0 else None
+        train_loader = DataLoader(train_ds, batch_size=b_size, shuffle=True, drop_last=False)
+        has_val = len(val_ds) > 0
+        val_loader = DataLoader(val_ds, batch_size=b_size, shuffle=False) if has_val else None
 
-        log.info(
-            "Train batches: %d | Val samples: %d",
-            len(train_loader), len(val_ds),
-        )
-
-        # ------------------------------------------------------------------ #
-        # Model
-        # ------------------------------------------------------------------ #
-        model = Configurable1DUNet(cfg).to(self.device)
-        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        log.info(
-            "Configurable1DUNet: features=%s  kernel=%d  dropout=%.2f  params=%d",
-            cfg.UNET_CONFIG["features"],
-            cfg.UNET_CONFIG["kernel_size"],
-            cfg.UNET_CONFIG["dropout"],
-            n_params,
-        )
-
-        # ------------------------------------------------------------------ #
-        # Optimizer, scheduler, loss
-        # ------------------------------------------------------------------ #
         optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=cfg.PRETRAIN_LR,
-            weight_decay=cfg.PRETRAIN_WEIGHT_DECAY,
-        )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=cfg.PRETRAIN_LR_FACTOR,
-            patience=cfg.PRETRAIN_LR_PATIENCE,
-            min_lr=cfg.PRETRAIN_LR_MIN,
-            verbose=False,
+            self.model.parameters(),
+            lr=learning_rate,
+            weight_decay=self.cfg.PRETRAIN_WEIGHT_DECAY,
         )
         criterion = nn.MSELoss()
-
-        # ------------------------------------------------------------------ #
-        # Training loop
-        # ------------------------------------------------------------------ #
-        best_val_loss = float("inf")
-        patience_counter = 0
-
-        for epoch in range(1, cfg.PRETRAIN_EPOCHS + 1):
-            # --- Train ---
-            model.train()
-            tr_loss = 0.0
-            for noisy, clean in train_loader:
-                noisy, clean = noisy.to(self.device), clean.to(self.device)
-                pred = model(noisy)
-                loss = criterion(pred, clean)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                tr_loss += loss.item()
-            tr_loss /= max(len(train_loader), 1)
-
-            # --- Validate ---
-            val_loss: Optional[float] = None
-            if val_loader is not None and len(val_ds) > 0:
-                model.eval()
-                running_val = 0.0
-                with torch.no_grad():
-                    for noisy, clean in val_loader:
-                        noisy, clean = noisy.to(self.device), clean.to(self.device)
-                        pred = model(noisy)
-                        running_val += criterion(pred, clean).item()
-                val_loss = running_val / max(len(val_loader), 1)
-                scheduler.step(val_loss)
-
-            current_lr = optimizer.param_groups[0]["lr"]
-            if val_loss is not None:
-                log.info(
-                    "Epoch %3d/%d | lr=%.2e | train MSE=%.6f | val MSE=%.6f",
-                    epoch, cfg.PRETRAIN_EPOCHS, current_lr, tr_loss, val_loss,
-                )
-            else:
-                log.info(
-                    "Epoch %3d/%d | lr=%.2e | train MSE=%.6f | (no val split)",
-                    epoch, cfg.PRETRAIN_EPOCHS, current_lr, tr_loss,
-                )
-
-            # --- Checkpoint & early stopping ---
-            monitor = val_loss if val_loss is not None else tr_loss
-            if monitor < best_val_loss:
-                best_val_loss = monitor
-                patience_counter = 0
-                if cfg.PRETRAIN_SAVE_BEST:
-                    _save_checkpoint(
-                        cfg.UNET_PRETRAINED_CHECKPOINT,
-                        model, epoch, monitor, cfg,
-                        tag="pretrain",
-                    )
-                    log.info(
-                        "  → Saved pretrained checkpoint (val_loss=%.6f)", monitor
-                    )
-            else:
-                patience_counter += 1
-                if patience_counter >= cfg.PRETRAIN_PATIENCE:
-                    log.info(
-                        "Early stopping after %d epochs without improvement.",
-                        cfg.PRETRAIN_PATIENCE,
-                    )
-                    break
-
-        # Always save final model (may not be best)
-        final_path = cfg.UNET_PRETRAINED_CHECKPOINT.replace(".pth", "_final.pth")
-        _save_checkpoint(
-            final_path, model, cfg.PRETRAIN_EPOCHS,
-            best_val_loss, cfg, tag="pretrain_final",
-        )
-        log.info(
-            "[SyntheticDenoiserTrainer] Done. Best monitor loss=%.6f", best_val_loss
-        )
-        log.info(
-            "Pretrained checkpoint: %s", cfg.UNET_PRETRAINED_CHECKPOINT
-        )
-        log.info(
-            "\n⚠  MANUAL VERIFICATION REQUIRED before running fine-tuning.\n"
-            "   Inspect the pretrained model on synthetic validation signals.\n"
-            "   When satisfied, run:\n"
-            "     python denoiser_finetune.py --stage finetune\n"
-        )
-
-
-# --------------------------------------------------------------------------- #
-# Stage 2B: Trial fine-tuning
-# --------------------------------------------------------------------------- #
-
-class TrialDataFineTuner:
-    """
-    Stage 2B: Unsupervised U-Net fine-tuning on real trial data.
-
-    Requires the pretrained checkpoint (from Stage 2A) to exist.
-    Will refuse to run without it.
-
-    Uses UnsupervisedNoiseSuppressionLoss.
-    Saves a SEPARATE fine-tuned checkpoint (Config.UNET_FINETUNED_CHECKPOINT).
-    The pretrained checkpoint is NEVER overwritten.
-
-    Parameters
-    ----------
-    cfg : Config
-        Configuration object.
-    """
-
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        set_seed(cfg.RANDOM_SEED, cfg.DETERMINISTIC)
-        ensure_dir(cfg.MODELS_DIR)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        log.info("[TrialDataFineTuner] Device: %s", self.device)
-
-    def run(self) -> None:
-        """Execute Stage 2B unsupervised fine-tuning."""
-        cfg = self.cfg
-
-        # ------------------------------------------------------------------ #
-        # Load pretrained model (mandatory)
-        # ------------------------------------------------------------------ #
-        model = Configurable1DUNet(cfg).to(self.device)
-        _load_checkpoint(cfg.UNET_PRETRAINED_CHECKPOINT, model, cfg)
-
-        # ------------------------------------------------------------------ #
-        # Trial dataset
-        # ------------------------------------------------------------------ #
-        log.info(
-            "Loading trial dataset from: %s (TRIAL_IS_COMPLEX=%s)",
-            cfg.TRIAL_DATA_DIR, cfg.TRIAL_IS_COMPLEX,
-        )
-        trial_ds = NoiseAdaptationUNetDataset(cfg, subset="all")
-        trial_loader = DataLoader(
-            trial_ds,
-            batch_size=cfg.FINETUNE_BATCH_SIZE,
-            shuffle=True,
-            drop_last=False,
-        )
-        log.info(
-            "Trial dataset: %d files | %d batches/epoch",
-            len(trial_ds), len(trial_loader),
-        )
-
-        # ------------------------------------------------------------------ #
-        # Optimizer, scheduler, loss
-        # ------------------------------------------------------------------ #
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=cfg.FINETUNE_LR,
-            weight_decay=cfg.FINETUNE_WEIGHT_DECAY,
-        )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        scheduler = ReduceLROnPlateau(
             optimizer,
             mode="min",
-            factor=cfg.FINETUNE_LR_FACTOR,
-            patience=cfg.FINETUNE_LR_PATIENCE,
-            min_lr=cfg.FINETUNE_LR_MIN,
-            verbose=False,
+            factor=self.cfg.PRETRAIN_LR_FACTOR,
+            patience=self.cfg.PRETRAIN_LR_PATIENCE,
+            min_lr=self.cfg.PRETRAIN_LR_MIN,
         )
-        criterion = UnsupervisedNoiseSuppressionLoss(lam=cfg.FINETUNE_NOISE_LAMBDA)
 
-        # ------------------------------------------------------------------ #
-        # Fine-tuning loop
-        # ------------------------------------------------------------------ #
         best_loss = float("inf")
         patience_counter = 0
 
-        for epoch in range(1, cfg.FINETUNE_EPOCHS + 1):
-            model.train()
-            epoch_loss = 0.0
-            n_batches = 0
+        logger.info("Starting Stage 2A Supervised Pretraining: %d epochs, batch_size=%d, lr=%.2e", num_epochs, b_size, learning_rate)
 
-            for noisy, noise_prof in trial_loader:
-                noisy = noisy.to(self.device)
-                noise_prof = noise_prof.to(self.device)
-
-                denoised = model(noisy)
-                loss = criterion(denoised, noisy, noise_prof)
-
+        for epoch in range(1, num_epochs + 1):
+            self.model.train()
+            train_loss = 0.0
+            for noisy, clean in train_loader:
+                noisy, clean = noisy.to(self.device), clean.to(self.device)
                 optimizer.zero_grad()
+                pred = self.model(noisy)
+                loss = criterion(pred, clean)
                 loss.backward()
                 optimizer.step()
+                train_loss += loss.item() * len(noisy)
+            train_loss /= len(train_ds)
 
-                epoch_loss += loss.item()
-                n_batches += 1
+            # Evaluation
+            if has_val and val_loader is not None:
+                self.model.eval()
+                val_loss = 0.0
+                noisy_baseline_loss = 0.0
+                with torch.no_grad():
+                    for noisy, clean in val_loader:
+                        noisy, clean = noisy.to(self.device), clean.to(self.device)
+                        pred = self.model(noisy)
+                        val_loss += criterion(pred, clean).item() * len(noisy)
+                        noisy_baseline_loss += criterion(noisy, clean).item() * len(noisy)
+                val_loss /= len(val_ds)
+                noisy_baseline_loss /= len(val_ds)
+                scheduler.step(val_loss)
+                monitored = val_loss
+                logger.info(
+                    "Epoch %02d/%02d - Train MSE: %.5f, Val MSE: %.5f (Input Noisy MSE: %.5f)",
+                    epoch, num_epochs, train_loss, val_loss, noisy_baseline_loss
+                )
+            else:
+                monitored = train_loss
+                scheduler.step(train_loss)
+                logger.info("Epoch %02d/%02d - Train MSE: %.5f", epoch, num_epochs, train_loss)
 
-            epoch_loss /= max(n_batches, 1)
-            scheduler.step(epoch_loss)
-            current_lr = optimizer.param_groups[0]["lr"]
+            if monitored < best_loss:
+                best_loss = monitored
+                patience_counter = 0
+                if self.cfg.PRETRAIN_SAVE_BEST:
+                    ensure_dir(self.cfg.UNET_PRETRAINED_CHECKPOINT)
+                    ckpt = {
+                        "tag": "pretrained",
+                        "epoch": epoch,
+                        "val_loss": best_loss,
+                        "model_state_dict": self.model.state_dict(),
+                        "unet_config": self.cfg.UNET_CONFIG,
+                        "signal_length": self.cfg.SIGNAL_LENGTH,
+                    }
+                    torch.save(ckpt, self.cfg.UNET_PRETRAINED_CHECKPOINT)
+                    logger.info("Saved best pretrained model to %s (MSE: %.5f)", self.cfg.UNET_PRETRAINED_CHECKPOINT, best_loss)
+            else:
+                patience_counter += 1
+                if patience_counter >= early_patience:
+                    logger.info("Early stopping triggered at epoch %d", epoch)
+                    break
 
-            log.info(
-                "Epoch %3d/%d | lr=%.2e | finetune loss=%.6f",
-                epoch, cfg.FINETUNE_EPOCHS, current_lr, epoch_loss,
+        # Save final checkpoint
+        final_ckpt_path = self.cfg.UNET_PRETRAINED_CHECKPOINT.replace(".pth", "_final.pth")
+        ensure_dir(final_ckpt_path)
+        torch.save({
+            "tag": "pretrained_final",
+            "epoch": epoch,
+            "val_loss": best_loss,
+            "model_state_dict": self.model.state_dict(),
+            "unet_config": self.cfg.UNET_CONFIG,
+            "signal_length": self.cfg.SIGNAL_LENGTH,
+        }, final_ckpt_path)
+        logger.info("Saved final pretrained model to %s", final_ckpt_path)
+
+        # Print mandatory manual verification notice
+        print("\n" + "=" * 70)
+        print("STAGE 2A PRETRAINING COMPLETE.")
+        print("ATTENTION: MANUAL VERIFICATION IS REQUIRED BEFORE FINE-TUNING!")
+        print("Inspect inference outputs and SNR improvements on synthetic validation data.")
+        print(f"Pretrained checkpoint: {self.cfg.UNET_PRETRAINED_CHECKPOINT}")
+        print("=" * 70 + "\n")
+
+        return {"best_loss": best_loss}
+
+
+class TrialDataFineTuner:
+    """
+    Stage 2B: Unsupervised Fine-Tuning on real hydrophone trial recordings.
+    Loads pretrained Stage 2A checkpoint, verifies architecture compatibility,
+    and optimizes UnsupervisedNoiseSuppressionLoss against quiet recording noise references.
+    """
+
+    def __init__(
+        self,
+        cfg: Optional[Config] = None,
+        device: Optional[str] = None,
+    ) -> None:
+        self.cfg = cfg or default_config
+        self.cfg.validate()
+        set_seed(self.cfg.RANDOM_SEED, self.cfg.DETERMINISTIC)
+
+        dev_str = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(dev_str)
+
+        # Refuse to run unless pretrained checkpoint exists
+        if not os.path.isfile(self.cfg.UNET_PRETRAINED_CHECKPOINT):
+            raise FileNotFoundError(
+                f"Stage 2A pretrained checkpoint not found at: '{self.cfg.UNET_PRETRAINED_CHECKPOINT}'. "
+                "You must complete Stage 2A pretraining and manual verification before Stage 2B fine-tuning."
             )
+
+        self.model = Configurable1DUNet(cfg=self.cfg).to(self.device)
+        self._load_checkpoint(self.cfg.UNET_PRETRAINED_CHECKPOINT)
+
+    def _load_checkpoint(self, checkpoint_path: str) -> None:
+        """
+        Validate checkpoint configuration and load weights.
+        """
+        logger.info("Loading pretrained checkpoint from %s", checkpoint_path)
+        ckpt = torch.load(checkpoint_path, map_location=self.device)
+
+        # Validate stored architecture matches current config
+        stored_features = ckpt.get("unet_config", {}).get("features")
+        cfg_features = self.cfg.UNET_CONFIG.get("features")
+        if stored_features != cfg_features:
+            raise ValueError(
+                f"UNet feature mismatch! Checkpoint features: {stored_features}, Config features: {cfg_features}"
+            )
+
+        stored_sig_len = ckpt.get("signal_length")
+        if stored_sig_len != self.cfg.TRIAL_SIGNAL_LENGTH:
+            logger.warning(
+                "Stored signal length (%s) differs from TRIAL_SIGNAL_LENGTH (%d). "
+                "Network is fully-convolutional and handles variable lengths.",
+                stored_sig_len, self.cfg.TRIAL_SIGNAL_LENGTH
+            )
+
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        logger.info("Successfully loaded Stage 2A weights (Epoch %s, Loss %s)", ckpt.get("epoch"), ckpt.get("val_loss"))
+
+    def finetune(
+        self,
+        epochs: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        lr: Optional[float] = None,
+        patience: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        num_epochs = epochs if epochs is not None else self.cfg.FINETUNE_EPOCHS
+        b_size = batch_size if batch_size is not None else self.cfg.FINETUNE_BATCH_SIZE
+        learning_rate = lr if lr is not None else self.cfg.FINETUNE_LR
+        early_patience = patience if patience is not None else self.cfg.FINETUNE_PATIENCE
+
+        train_ds = NoiseAdaptationUNetDataset(self.cfg, subset="all")
+        if len(train_ds) == 0:
+            raise RuntimeError(
+                f"No trial data available in {self.cfg.TRIAL_DATA_DIR}. "
+                "Run generate_trial_data.py first."
+            )
+
+        train_loader = DataLoader(train_ds, batch_size=b_size, shuffle=True, drop_last=False)
+
+        optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=learning_rate,
+            weight_decay=self.cfg.FINETUNE_WEIGHT_DECAY,
+        )
+        criterion = UnsupervisedNoiseSuppressionLoss(lam=self.cfg.FINETUNE_NOISE_LAMBDA)
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=self.cfg.FINETUNE_LR_FACTOR,
+            patience=self.cfg.FINETUNE_LR_PATIENCE,
+            min_lr=self.cfg.FINETUNE_LR_MIN,
+        )
+
+        best_loss = float("inf")
+        patience_counter = 0
+
+        logger.info("Starting Stage 2B Fine-Tuning: %d epochs, batch_size=%d, lr=%.2e", num_epochs, b_size, learning_rate)
+
+        for epoch in range(1, num_epochs + 1):
+            self.model.train()
+            epoch_loss = 0.0
+            for noisy, noise_ref in train_loader:
+                noisy, noise_ref = noisy.to(self.device), noise_ref.to(self.device)
+                optimizer.zero_grad()
+                denoised = self.model(noisy)
+                loss = criterion(denoised, noisy, noise_ref)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item() * len(noisy)
+            epoch_loss /= len(train_ds)
+            scheduler.step(epoch_loss)
+
+            logger.info("Epoch %02d/%02d - Unsupervised Loss: %.5f", epoch, num_epochs, epoch_loss)
 
             if epoch_loss < best_loss:
                 best_loss = epoch_loss
                 patience_counter = 0
-                _save_checkpoint(
-                    cfg.UNET_FINETUNED_CHECKPOINT,
-                    model, epoch, epoch_loss, cfg,
-                    tag="finetune",
+
+                # Ensure we save to separate checkpoint and NEVER overwrite the pretrained checkpoint
+                assert self.cfg.UNET_FINETUNED_CHECKPOINT != self.cfg.UNET_PRETRAINED_CHECKPOINT, (
+                    "Checkpoint collision: UNET_FINETUNED_CHECKPOINT must differ from UNET_PRETRAINED_CHECKPOINT"
                 )
-                log.info(
-                    "  → Saved fine-tuned checkpoint (loss=%.6f)", epoch_loss
-                )
+
+                ensure_dir(self.cfg.UNET_FINETUNED_CHECKPOINT)
+                ckpt = {
+                    "tag": "finetuned",
+                    "epoch": epoch,
+                    "val_loss": best_loss,
+                    "model_state_dict": self.model.state_dict(),
+                    "unet_config": self.cfg.UNET_CONFIG,
+                    "signal_length": self.cfg.TRIAL_SIGNAL_LENGTH,
+                }
+                torch.save(ckpt, self.cfg.UNET_FINETUNED_CHECKPOINT)
+                logger.info("Saved fine-tuned checkpoint to %s (Loss: %.5f)", self.cfg.UNET_FINETUNED_CHECKPOINT, best_loss)
             else:
                 patience_counter += 1
-                if patience_counter >= cfg.FINETUNE_PATIENCE:
-                    log.info(
-                        "Early stopping after %d epochs without improvement.",
-                        cfg.FINETUNE_PATIENCE,
-                    )
+                if patience_counter >= early_patience:
+                    logger.info("Early stopping triggered at epoch %d", epoch)
                     break
 
-        log.info(
-            "[TrialDataFineTuner] Done. Best fine-tune loss=%.6f", best_loss
-        )
-        log.info("Fine-tuned checkpoint: %s", cfg.UNET_FINETUNED_CHECKPOINT)
+        logger.info("Stage 2B Fine-Tuning complete. Best Loss: %.5f", best_loss)
+        return {"best_loss": best_loss}
 
 
-# --------------------------------------------------------------------------- #
-# Entry point
-# --------------------------------------------------------------------------- #
-
-def _parse_args():
-    parser = argparse.ArgumentParser(
-        description=(
-            "NSTL Acoustic Denoiser — Stage 2 training.\n\n"
-            "Stages:\n"
-            "  pretrain  Stage 2A: supervised pretraining on synthetic pairs\n"
-            "  finetune  Stage 2B: unsupervised fine-tuning on real trial data\n\n"
-            "IMPORTANT: Always manually verify the pretrained model before fine-tuning."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+def main():
+    parser = argparse.ArgumentParser(description="Stage 2 U-Net Denoiser (Pretrain / Finetune)")
     parser.add_argument(
         "--stage",
+        type=str,
         choices=["pretrain", "finetune"],
         default=None,
-        help=(
-            "Which training stage to run.  "
-            "Defaults to 'pretrain' (safer default)."
-        ),
+        help="Stage to execute: 'pretrain' (Stage 2A) or 'finetune' (Stage 2B). Defaults to 'pretrain'.",
     )
-    return parser.parse_args()
+    parser.add_argument("--epochs", type=int, default=None, help="Epoch override")
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size override")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate override")
+    parser.add_argument("--device", type=str, default=None, help="Device override (cpu/cuda)")
+    args = parser.parse_args()
+
+    stage = args.stage
+    if stage is None:
+        logger.warning("No --stage argument supplied. Defaulting to 'pretrain'.")
+        stage = "pretrain"
+
+    cfg = Config()
+
+    if stage == "pretrain":
+        trainer = SyntheticDenoiserTrainer(cfg=cfg, device=args.device)
+        trainer.train(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
+    elif stage == "finetune":
+        print("\n" + "=" * 70)
+        print("STAGE 2B: UNSUPERVISED NOISE ADAPTATION FINE-TUNING")
+        print("Reminder: Ensure Stage 2A manual verification was completed successfully.")
+        print("Waiting 3 seconds before commencing fine-tuning...")
+        print("=" * 70 + "\n")
+        time.sleep(3)
+
+        finetuner = TrialDataFineTuner(cfg=cfg, device=args.device)
+        finetuner.finetune(epochs=args.epochs, batch_size=args.batch_size, lr=args.lr)
 
 
 if __name__ == "__main__":
-    args = _parse_args()
-    cfg = Config()
-
-    if args.stage is None:
-        log.warning(
-            "--stage was not specified.  Defaulting to 'pretrain' (the safer choice).\n"
-            "To run trial fine-tuning, explicitly pass --stage finetune AFTER\n"
-            "manually verifying the pretrained model.\n"
-        )
-        args.stage = "pretrain"
-
-    if args.stage == "pretrain":
-        trainer = SyntheticDenoiserTrainer(cfg)
-        trainer.run()
-
-    elif args.stage == "finetune":
-        log.info(
-            "=== Stage 2B: Trial Fine-Tuning ===\n"
-            "This step assumes you have MANUALLY VERIFIED the pretrained model.\n"
-            "Starting fine-tuning in 3 seconds...\n"
-        )
-        import time
-        time.sleep(3)
-        finetuner = TrialDataFineTuner(cfg)
-        finetuner.run()
+    main()

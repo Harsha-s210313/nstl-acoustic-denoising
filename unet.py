@@ -1,73 +1,41 @@
 """
-unet.py
--------
-Stage 2: Configurable1DUNet
-A configurable 1D U-Net for acoustic signal denoising.
-
-Architecture
-------------
-  Encoder: N conv-blocks (each = Conv → BN → ReLU → Conv → BN → ReLU),
-            followed by MaxPool downsampling.
-  Bottleneck: one conv-block at the coarsest scale.
-  Decoder: N upsample + skip-concat + conv-block stages.
-  Output: 1×1 Conv to map back to ``out_channels``.
-
-The number of levels and channel widths are fully determined by
-``Config.UNET_CONFIG["features"]``.  E.g.:
-
-    features = [16, 32, 64, 128]  →  4 encoder levels + bottleneck
-
-No code changes are needed to switch from [16,32,64,128] to [32,64,128,256].
-
-Input/output shapes
--------------------
-  Input  : (B, in_channels,  SIGNAL_LENGTH)
-  Output : (B, out_channels, SIGNAL_LENGTH)
-
-The output length always matches the input length: the decoder uses
-``F.interpolate`` (linear mode) before each skip-connection merge to handle
-any odd-length artefacts from integer downsampling.
-
-Dropout is applied in each conv-block (after the second convolution) with
-probability ``Config.UNET_CONFIG["dropout"]``.  Set to 0.0 to disable.
+Configurable 1-D U-Net for Underwater Acoustic Signal Denoising.
+Fully convolutional architecture supporting arbitrary input lengths
+(e.g., L=25000, L=5000, and odd lengths such as L=4999).
 """
 
+from typing import Dict, Any, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List
 
-from config import Config
+try:
+    from .config import Config, default_config
+except (ImportError, ValueError):
+    from config import Config, default_config
 
-
-# --------------------------------------------------------------------------- #
-# Building-block
-# --------------------------------------------------------------------------- #
 
 class _DoubleConv(nn.Module):
     """
-    Two sequential Conv1d → BatchNorm1d → ReLU blocks, with optional Dropout
-    after the second convolution.
-
-    Parameters
-    ----------
-    in_ch, out_ch : int
-        Input and output channel counts.
-    kernel : int
-        Convolution kernel size (must be odd for symmetric padding).
-    dropout : float
-        Dropout probability (0.0 = disabled).
+    (Conv1d(k, pad=k//2, bias=False) -> BN -> ReLU) x 2,
+    optionally followed by Dropout if dropout > 0.
     """
 
-    def __init__(self, in_ch: int, out_ch: int, kernel: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
-        pad = kernel // 2
+        pad = kernel_size // 2
         layers = [
-            nn.Conv1d(in_ch, out_ch, kernel_size=kernel, padding=pad, bias=False),
-            nn.BatchNorm1d(out_ch),
+            nn.Conv1d(in_channels, out_channels, kernel_size, padding=pad, bias=False),
+            nn.BatchNorm1d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Conv1d(out_ch, out_ch, kernel_size=kernel, padding=pad, bias=False),
-            nn.BatchNorm1d(out_ch),
+            nn.Conv1d(out_channels, out_channels, kernel_size, padding=pad, bias=False),
+            nn.BatchNorm1d(out_channels),
             nn.ReLU(inplace=True),
         ]
         if dropout > 0.0:
@@ -78,145 +46,110 @@ class _DoubleConv(nn.Module):
         return self.block(x)
 
 
-# --------------------------------------------------------------------------- #
-# U-Net
-# --------------------------------------------------------------------------- #
-
 class Configurable1DUNet(nn.Module):
     """
-    Fully configurable 1D U-Net for signal denoising.
-
-    All architecture choices come from Config.UNET_CONFIG:
-        features    : list of encoder channel widths (one entry = one level)
-        kernel_size : convolution kernel (odd integer)
-        dropout     : dropout probability
-        in_channels : input channels (1 for real-valued signals)
-        out_channels: output channels (1 for real-valued signals)
-
-    Input  : (B, in_channels,  L)
-    Output : (B, out_channels, L)   — same length L as input
-
-    Parameters
-    ----------
-    cfg : Config
-        Configuration object.
-
-    Raises
-    ------
-    ValueError
-        If ``features`` is empty or ``kernel_size`` is even.
+    Fully-convolutional 1D U-Net driven entirely by UNET_CONFIG.
+    Maintains skip connections, linear interpolation upsampling with 1x1 projection,
+    and a final length-preservation guard.
     """
 
-    def __init__(self, cfg: Config):
+    def __init__(
+        self,
+        cfg: Optional[Config] = None,
+        unet_config: Optional[Dict[str, Any]] = None,
+    ) -> None:
         super().__init__()
+        c = unet_config if unet_config is not None else (cfg.UNET_CONFIG if cfg else default_config.UNET_CONFIG)
 
-        unet_cfg = cfg.UNET_CONFIG
-        features: List[int] = unet_cfg["features"]
-        kernel: int = unet_cfg["kernel_size"]
-        dropout: float = unet_cfg["dropout"]
-        in_ch: int = unet_cfg["in_channels"]
-        out_ch: int = unet_cfg["out_channels"]
+        features: List[int] = c.get("features", [16, 32, 64, 128])
+        kernel_size: int = c.get("kernel_size", 7)
+        dropout: float = float(c.get("dropout", 0.1))
+        in_channels: int = c.get("in_channels", 1)
+        out_channels: int = c.get("out_channels", 1)
 
-        if not features:
-            raise ValueError("UNET_CONFIG['features'] must be a non-empty list.")
-        if kernel % 2 == 0:
-            raise ValueError(
-                f"UNET_CONFIG['kernel_size'] must be odd, got {kernel}."
-            )
+        # Validation
+        if not features or not all(isinstance(f, int) and f > 0 for f in features):
+            raise ValueError(f"UNet features must be a non-empty list of positive ints, got {features}")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError(f"UNet kernel_size must be a positive odd integer, got {kernel_size}")
+        if dropout < 0.0 or dropout >= 1.0:
+            raise ValueError(f"UNet dropout must be in [0, 1), got {dropout}")
 
         self.features = features
-        self.n_levels = len(features)
+        self.kernel_size = kernel_size
+        self.dropout = dropout
+        self.in_channels = in_channels
+        self.out_channels = out_channels
 
-        # ------------------------------------------------------------------ #
-        # Encoder
-        # ------------------------------------------------------------------ #
-        self.encoder_blocks = nn.ModuleList()
+        # Encoder path
+        self.encoders = nn.ModuleList()
+        curr_in = in_channels
+        for feat in features:
+            self.encoders.append(_DoubleConv(curr_in, feat, kernel_size, dropout))
+            curr_in = feat
+
         self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
 
-        prev_ch = in_ch
-        for feat in features:
-            self.encoder_blocks.append(_DoubleConv(prev_ch, feat, kernel, dropout))
-            prev_ch = feat
+        # Bottleneck
+        self.bottleneck = _DoubleConv(
+            features[-1],
+            features[-1] * 2,
+            kernel_size,
+            dropout,
+        )
 
-        # ------------------------------------------------------------------ #
-        # Bottleneck (one level deeper, double the last feature count)
-        # ------------------------------------------------------------------ #
-        bottleneck_ch = features[-1] * 2
-        self.bottleneck = _DoubleConv(features[-1], bottleneck_ch, kernel, dropout)
+        # Decoder path
+        self.up_projections = nn.ModuleList()
+        self.decoders = nn.ModuleList()
 
-        # ------------------------------------------------------------------ #
-        # Decoder
-        # ------------------------------------------------------------------ #
-        # At each decoder level:
-        #   in_ch = bottleneck_ch (or prev decoder_ch) + skip_ch
-        # The upsampled tensor is concatenated with the matching encoder skip.
-        self.decoder_upconvs = nn.ModuleList()   # 1×1 projection before merge
-        self.decoder_blocks = nn.ModuleList()
-
-        up_ch = bottleneck_ch
+        prev_feat = features[-1] * 2
         for feat in reversed(features):
-            # Projection: halve the channels of the upsampled tensor
-            self.decoder_upconvs.append(
-                nn.Conv1d(up_ch, feat, kernel_size=1, bias=False)
-            )
-            # After concatenation with skip: feat + feat = 2*feat input channels
-            self.decoder_blocks.append(_DoubleConv(2 * feat, feat, kernel, dropout))
-            up_ch = feat
+            # 1x1 conv projection to reduce channel dimensions after interpolation
+            self.up_projections.append(nn.Conv1d(prev_feat, feat, kernel_size=1, bias=False))
+            # DoubleConv takes concatenated channels (skip `feat` + projected `feat` = 2*feat) down to `feat`
+            self.decoders.append(_DoubleConv(feat * 2, feat, kernel_size, dropout))
+            prev_feat = feat
 
-        # ------------------------------------------------------------------ #
-        # Output head
-        # ------------------------------------------------------------------ #
-        self.out_conv = nn.Conv1d(features[0], out_ch, kernel_size=1, bias=True)
+        # Output projection
+        self.out_conv = nn.Conv1d(features[0], out_channels, kernel_size=1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Parameters
-        ----------
-        x : torch.Tensor
-            Shape (B, in_channels, L).
-
-        Returns
-        -------
-        torch.Tensor
-            Shape (B, out_channels, L)  — same length as input.
+        Forward pass.
+        Expects x: (B, in_channels, L) or (B, L)
+        Returns: (B, out_channels, L)
         """
-        # Store input length for final interpolation guard
-        input_len = x.shape[-1]
+        if x.ndim == 1:
+            x = x.unsqueeze(0).unsqueeze(0)
+        elif x.ndim == 2:
+            x = x.unsqueeze(1)
 
-        # ------------------------------------------------------------------ #
-        # Encoder pass — collect skip connections
-        # ------------------------------------------------------------------ #
+        orig_len = x.shape[-1]
         skips: List[torch.Tensor] = []
-        for block in self.encoder_blocks:
-            x = block(x)
-            skips.append(x)
-            x = self.pool(x)
 
-        # ------------------------------------------------------------------ #
+        # Encoder forward
+        out = x
+        for enc in self.encoders:
+            out = enc(out)
+            skips.append(out)
+            out = self.pool(out)
+
         # Bottleneck
-        # ------------------------------------------------------------------ #
-        x = self.bottleneck(x)
+        out = self.bottleneck(out)
 
-        # ------------------------------------------------------------------ #
-        # Decoder pass — reverse skip order
-        # ------------------------------------------------------------------ #
-        for i, (up_conv, dec_block) in enumerate(
-            zip(self.decoder_upconvs, self.decoder_blocks)
-        ):
-            skip = skips[self.n_levels - 1 - i]
+        # Decoder forward
+        for up_proj, dec, skip in zip(self.up_projections, self.decoders, reversed(skips)):
+            # Linear interpolate to match exact skip length
+            out = F.interpolate(out, size=skip.shape[-1], mode="linear", align_corners=False)
+            out = up_proj(out)
+            out = torch.cat([skip, out], dim=1)
+            out = dec(out)
 
-            # Upsample to match skip length (handles odd-length artefacts)
-            x = F.interpolate(x, size=skip.shape[-1], mode="linear", align_corners=False)
-            x = up_conv(x)                         # project channels
+        # 1x1 output conv
+        out = self.out_conv(out)
 
-            x = torch.cat([skip, x], dim=1)        # channel-wise concat
-            x = dec_block(x)
+        # Final guard so output length strictly matches input length
+        if out.shape[-1] != orig_len:
+            out = F.interpolate(out, size=orig_len, mode="linear", align_corners=False)
 
-        # ------------------------------------------------------------------ #
-        # Output head — ensure final length == input length
-        # ------------------------------------------------------------------ #
-        x = self.out_conv(x)
-        if x.shape[-1] != input_len:
-            x = F.interpolate(x, size=input_len, mode="linear", align_corners=False)
-
-        return x
+        return out

@@ -1,642 +1,365 @@
 """
-inference.py
-------------
-Inference script for the NSTL Acoustic Denoising Pipeline.
-
-Usage
------
-Synthetic source (uses pretrained checkpoint by default):
-    python inference.py --source synthetic
-
-Trial source (requires fine-tuned checkpoint):
-    python inference.py --source trial
-
-Explicit checkpoint override:
-    python inference.py --source synthetic --checkpoint models/unet_pretrained.pth
-    python inference.py --source trial     --checkpoint models/unet_finetuned.pth
-
-Optional: specify which file to run inference on:
-    python inference.py --source synthetic --file data/synthetic/noisy/sig_001.dat
-    python inference.py --source trial     --pri pri02 --channel 1
-
-Outputs
--------
-  - Console: SNR-proxy improvement (energy ratio before/after denoising)
-  - File:    inference_output/<timestamp>_<source>_input.npy
-             inference_output/<timestamp>_<source>_output.npy
-
-Design choices
---------------
-- Synthetic source → pretrained checkpoint  (default, always available after 2A)
-- Trial source     → fine-tuned checkpoint  (requires 2B to have run)
-- Source must be explicitly given; there is no opaque default that could
-  silently apply a synthetic-only model to OOD trial data.
-- The script clearly prints which source and checkpoint are being used.
+Inference engine for underwater acoustic signal detection and denoising.
+Processes synthetic or trial recordings, performs active-region extraction,
+applies Stage 1 Detector and Stage 2 U-Net Denoiser, computes SNR metrics,
+and exports text .dat files and headless visual diagnostic plots.
 """
 
-import argparse
-import logging
 import os
 import sys
-from datetime import datetime
-
+import glob
+import argparse
+import logging
+from typing import Dict, Any, Optional, Tuple
 import numpy as np
 import torch
 
-from config import Config
-from denoiser_finetune import _load_checkpoint
-from unet import Configurable1DUNet
-from utils import (
-    ensure_dir,
-    extract_active_region,
-    load_dat_file,
-    normalize_signal,
-    denormalize_signal,
-    set_seed,
-    to_tensor,
-)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-log = logging.getLogger(__name__)
-
-
-# --------------------------------------------------------------------------- #
-# File resolution helpers
-# --------------------------------------------------------------------------- #
-
-def _resolve_synthetic_file(cfg: Config, explicit_file: str = None) -> str:
-    """
-    Return the path to a synthetic noisy file to use for inference.
-
-    Priority:
-    1. User-supplied --file argument.
-    2. First file in the synthetic noisy/ directory (as a demo sample).
-
-    Raises FileNotFoundError if neither source provides a valid file.
-    """
-    if explicit_file:
-        if not os.path.isfile(explicit_file):
-            raise FileNotFoundError(
-                f"--file not found: {explicit_file!r}"
-            )
-        return explicit_file
-
-    noisy_dir = os.path.join(
-        cfg.SYNTHETIC_DATA_DIR, cfg.SYNTHETIC_NOISY_SUBDIR
+try:
+    from .config import Config, default_config
+    from .utils import (
+        load_dat_file,
+        save_dat_file,
+        normalize_signal,
+        denormalize_signal,
+        extract_active_region,
+        extract_noise_reference,
+        ensure_dir,
+        to_tensor,
     )
-    if not os.path.isdir(noisy_dir):
-        raise FileNotFoundError(
-            f"Synthetic noisy directory not found: {noisy_dir!r}. "
-            "Run synthetic data generation first."
-        )
-    candidates = sorted(
-        os.path.join(noisy_dir, f)
-        for f in os.listdir(noisy_dir)
-        if f.lower().endswith(".dat")
+    from .detector import SignalDetectorCNN
+    from .unet import Configurable1DUNet
+except (ImportError, ValueError):
+    from config import Config, default_config
+    from utils import (
+        load_dat_file,
+        save_dat_file,
+        normalize_signal,
+        denormalize_signal,
+        extract_active_region,
+        extract_noise_reference,
+        ensure_dir,
+        to_tensor,
     )
-    if not candidates:
-        raise FileNotFoundError(
-            f"No .dat files found in {noisy_dir!r}. "
-            "Populate the synthetic noisy directory."
-        )
-    return candidates[0]
+    from detector import SignalDetectorCNN
+    from unet import Configurable1DUNet
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 
-def _resolve_trial_file(cfg: Config, pri: str, channel: int) -> str:
+def calculate_snr_db(signal: np.ndarray, noise: np.ndarray) -> float:
     """
-    Return the path to a specific trial signal file.
-
-    Parameters
-    ----------
-    pri     : str  PRI folder name (e.g. "pri01")
-    channel : int  Channel index (0-based)
+    Compute Signal-to-Noise Ratio (SNR) in decibels: 10 * log10(P_sig / P_noise).
     """
-    fname = f"channel{channel}.dat"
-    path = os.path.join(
-        cfg.TRIAL_DATA_DIR, cfg.TRIAL_SIGNAL_SUBDIR, pri, fname
-    )
-    if not os.path.isfile(path):
-        raise FileNotFoundError(
-            f"Trial file not found: {path!r}. "
-            f"Check --pri and --channel arguments, and that TRIAL_DATA_DIR "
-            f"({cfg.TRIAL_DATA_DIR!r}) is populated."
-        )
-    return path
+    p_sig = float(np.mean(signal ** 2))
+    p_noise = float(np.mean(noise ** 2))
+    if p_noise < 1e-12:
+        return 50.0  # Cap at high SNR
+    if p_sig < 1e-12:
+        return -50.0
+    return float(10.0 * np.log10(p_sig / p_noise))
 
 
-# --------------------------------------------------------------------------- #
-# Checkpoint resolution
-# --------------------------------------------------------------------------- #
-
-def _resolve_checkpoint(cfg: Config, source: str, explicit_ckpt: str = None) -> str:
+def run_pipeline(
+    source: str = "synthetic",
+    pri: Optional[str] = None,
+    channel: Optional[str] = None,
+    model_type: Optional[str] = None,
+    checkpoint: Optional[str] = None,
+    detector_checkpoint: Optional[str] = None,
+    device: Optional[str] = None,
+    cfg: Optional[Config] = None,
+    save_plot: bool = True,
+    show_plot: bool = False,
+) -> Dict[str, Any]:
     """
-    Return the checkpoint path to use, with clear error messages.
-
-    Logic:
-    - If --checkpoint is given explicitly, use it (and validate it exists).
-    - If source == "synthetic", use UNET_PRETRAINED_CHECKPOINT.
-    - If source == "trial",     prefer UNET_FINETUNED_CHECKPOINT if it exists,
-                                fall back to UNET_PRETRAINED_CHECKPOINT with a
-                                prominent warning.
+    Execute full detection + denoising inference pipeline.
     """
-    if explicit_ckpt:
-        if not os.path.isfile(explicit_ckpt):
-            raise FileNotFoundError(
-                f"Explicitly specified checkpoint not found: {explicit_ckpt!r}"
-            )
-        return explicit_ckpt
+    config = cfg or default_config
+    config.validate()
 
-    if source == "synthetic":
-        ckpt = cfg.UNET_PRETRAINED_CHECKPOINT
-        if not os.path.isfile(ckpt):
-            raise FileNotFoundError(
-                f"Pretrained checkpoint not found: {ckpt!r}. "
-                "Run Stage 2A pretraining first:\n"
-                "    python denoiser_pretrain.py"
-            )
-        return ckpt
+    dev_str = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    dev = torch.device(dev_str)
 
-    # source == "trial"
-    if os.path.isfile(cfg.UNET_FINETUNED_CHECKPOINT):
-        return cfg.UNET_FINETUNED_CHECKPOINT
+    # 1. Resolve Input File Path
+    clean_path = None
+    is_trial = False
+
+    if source.lower() == "synthetic":
+        noisy_dir = os.path.join(config.SYNTHETIC_DATA_DIR, config.SYNTHETIC_NOISY_SUBDIR)
+        if not os.path.isdir(noisy_dir):
+            for alt in [
+                os.path.join(config.SYNTHETIC_DATA_DIR, "synthetic", "noisy"),
+                os.path.join(config.SYNTHETIC_DATA_DIR, "noisy"),
+            ]:
+                if os.path.isdir(alt):
+                    noisy_dir = alt
+                    break
+
+        clean_dir = os.path.join(config.SYNTHETIC_DATA_DIR, config.SYNTHETIC_CLEAN_SUBDIR)
+        if not os.path.isdir(clean_dir):
+            for alt in [
+                os.path.join(config.SYNTHETIC_DATA_DIR, "synthetic", "clean"),
+                os.path.join(config.SYNTHETIC_DATA_DIR, "clean"),
+            ]:
+                if os.path.isdir(alt):
+                    clean_dir = alt
+                    break
+
+        available_files = sorted(glob.glob(os.path.join(noisy_dir, "*.dat")))
+        if not available_files:
+            raise FileNotFoundError(f"No synthetic noisy files found in {noisy_dir}")
+        input_path = available_files[0]
+        c_candidate = os.path.join(clean_dir, os.path.basename(input_path))
+        if os.path.isfile(c_candidate):
+            clean_path = c_candidate
+    elif source.lower() == "trial":
+        is_trial = True
+        pri_val = pri if pri is not None else config.INFERENCE_TRIAL_PRI
+        ch_val = channel or config.INFERENCE_TRIAL_CHANNEL
+
+        # Check candidate paths in priority order
+        candidates = []
+        if pri_val and config.TRIAL_SIGNAL_SUBDIR:
+            candidates.append(os.path.join(config.TRIAL_DATA_DIR, config.TRIAL_SIGNAL_SUBDIR, pri_val, ch_val))
+        if pri_val:
+            candidates.append(os.path.join(config.TRIAL_DATA_DIR, pri_val, ch_val))
+        if config.TRIAL_SIGNAL_SUBDIR:
+            candidates.append(os.path.join(config.TRIAL_DATA_DIR, config.TRIAL_SIGNAL_SUBDIR, ch_val))
+        candidates.append(os.path.join(config.TRIAL_DATA_DIR, ch_val))
+
+        input_path = None
+        for cand in candidates:
+            if os.path.isfile(cand):
+                input_path = cand
+                break
+
+        if input_path is None:
+            # Search recursively for matching channel name or any dat file in TRIAL_DATA_DIR
+            pattern = os.path.join(config.TRIAL_DATA_DIR, "**", ch_val)
+            matches = glob.glob(pattern, recursive=True)
+            if matches:
+                input_path = matches[0]
+            else:
+                all_dats = sorted(glob.glob(os.path.join(config.TRIAL_DATA_DIR, "**", "*.dat"), recursive=True))
+                if all_dats:
+                    input_path = all_dats[0]
+                    logger.warning("Requested trial file '%s' not found. Falling back to %s", ch_val, input_path)
+                else:
+                    raise FileNotFoundError(f"No trial data files found under {config.TRIAL_DATA_DIR}")
     else:
-        log.warning(
-            "\n"
-            "⚠  Fine-tuned checkpoint not found at %r.\n"
-            "   Falling back to pretrained checkpoint (%r).\n"
-            "   NOTE: This model has NOT been fine-tuned on trial data.\n"
-            "   Results may be suboptimal.  Run Stage 2B first:\n"
-            "       python denoiser_finetune.py --stage finetune\n",
-            cfg.UNET_FINETUNED_CHECKPOINT,
-            cfg.UNET_PRETRAINED_CHECKPOINT,
-        )
-        ckpt = cfg.UNET_PRETRAINED_CHECKPOINT
-        if not os.path.isfile(ckpt):
-            raise FileNotFoundError(
-                f"Neither fine-tuned ({cfg.UNET_FINETUNED_CHECKPOINT!r}) nor "
-                f"pretrained ({cfg.UNET_PRETRAINED_CHECKPOINT!r}) checkpoint found. "
-                "Run Stage 2A pretraining first."
-            )
-        return ckpt
+        # User supplied explicit path
+        input_path = source
+        if not os.path.isfile(input_path):
+            raise FileNotFoundError(f"File not found: {input_path}")
+        raw_check = load_dat_file(input_path)
+        is_trial = len(raw_check) < 22000
 
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    logger.info("Running inference on: %s (is_trial=%s)", input_path, is_trial)
 
-# --------------------------------------------------------------------------- #
-# Plotting helper
-# --------------------------------------------------------------------------- #
+    # 2. Preprocess Signal
+    raw_signal = load_dat_file(input_path)
+    clean_signal = None
 
-def _plot_results(
-    raw_signal: np.ndarray,
-    denoised: np.ndarray,
-    residual: np.ndarray,
-    snr_db: float,
-    source: str,
-    input_path: str,
-    save_path: str,
-) -> None:
-    """
-    Display a 3-panel figure:
-      Panel 1 — Noisy input signal
-      Panel 2 — Denoised output signal
-      Panel 3 — Residual (input − denoised)
-
-    The figure is shown on screen (plt.show()) and saved as a PNG.
-
-    Parameters
-    ----------
-    raw_signal  : 1-D array, original noisy input
-    denoised    : 1-D array, U-Net output
-    residual    : 1-D array, raw_signal − denoised
-    snr_db      : float, SNR proxy value to display in title
-    source      : "synthetic" or "trial"
-    input_path  : path of the input file (shown in subtitle)
-    save_path   : full path to save the PNG
-    """
-    try:
-        import matplotlib
-        matplotlib.use("TkAgg")          # works in IDLE; change to "Qt5Agg" if needed
-        import matplotlib.pyplot as plt
-    except ImportError:
-        log.error(
-            "matplotlib is not installed. Cannot plot results.\n"
-            "Install it with: pip install matplotlib"
-        )
-        return
-
-    samples = np.arange(len(raw_signal))
-    fname   = os.path.basename(input_path)
-
-    fig, axes = plt.subplots(3, 1, figsize=(14, 8), sharex=True)
-    fig.suptitle(
-        f"NSTL Acoustic Denoiser — {source.upper()} | {fname}\n"
-        f"SNR proxy: {snr_db:.2f} dB",
-        fontsize=12, fontweight="bold",
-    )
-
-    # Panel 1 — Noisy input
-    axes.plot(samples, raw_signal, color="#e05c5c", linewidth=0.6)
-    axes.set_ylabel("Amplitude")
-    axes.set_title("Noisy Input")
-    axes.grid(True, alpha=0.3)
-
-    # Panel 2 — Denoised output
-    axes.plot(samples, denoised, color="#4c9be8", linewidth=0.6)
-    axes.set_ylabel("Amplitude")
-    axes.set_title("Denoised Output")
-    axes.grid(True, alpha=0.3)
-
-##    # Panel 3 — Residual
-##    axes[2].plot(samples, residual, color="#6abf69", linewidth=0.6)
-##    axes[2].set_ylabel("Amplitude")
-##    axes[2].set_xlabel("Sample index")
-##    axes[2].set_title("Residual (Input − Denoised)")
-##    axes[2].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-
-    # Save first, then show (show() blocks until the window is closed)
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    log.info("Plot saved → %s", save_path)
-    plt.show()
-    plt.close(fig)
-
-
-
-def _plot_trial_results(
-    full_signal: np.ndarray,
-    output_full: np.ndarray,
-    active_input: np.ndarray,
-    denoised_active: np.ndarray,
-    start: int,
-    end: int,
-    snr_db: float,
-    cfg,
-    input_path: str,
-    save_path: str,
-) -> None:
-    """
-    2-panel plot — noisy input and denoised output overlaid on both panels:
-      Panel 1 — Full 4-second view  (overview of the whole recording)
-      Panel 2 — Zoomed into the active window  (see exactly what the model changed)
-    """
-    try:
-        import matplotlib
-        matplotlib.use("TkAgg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        log.error("matplotlib not installed. Cannot plot.")
-        return
-
-    sr    = cfg.TRIAL_SAMPLE_RATE   # 17,800 Hz — correct for real trial files
-    fname = os.path.basename(input_path)
-    n     = len(full_signal)
-
-    # Full time axis (ms)
-    t_full = np.arange(n) / sr * 1000.0
-
-    # Zoomed time axis — only the active window, in ms
-    zoom_start = max(0, start - 500)            # tiny extra margin for context
-    zoom_end   = min(n - 1, end + 500)
-    t_zoom     = np.arange(zoom_start, zoom_end + 1) / sr * 1000.0
-
-    fig, axes = plt.subplots(2, 1, figsize=(16, 8))
-    fig.suptitle(
-        f"NSTL Trial Inference — {fname}\n"
-        f"Active window: {start/sr*1000:.1f} – {end/sr*1000:.1f} ms  |  "
-        f"SNR proxy: {snr_db:.2f} dB",
-        fontsize=11, fontweight="bold",
-    )
-
-    # ------------------------------------------------------------------ #
-    # Panel 1 — Full 4-second view: noisy + denoised overlaid
-    # ------------------------------------------------------------------ #
-    axes[0].plot(t_full, full_signal,
-                 color="#4c9be8", linewidth=0.3, alpha=0.6, label="Noisy input")
-    axes[0].plot(t_full, output_full,
-                 color="#e05c5c", linewidth=0.5, label="Denoised output")
-    axes[0].axvspan(start / sr * 1000, end / sr * 1000,
-                    alpha=0.12, color="green", label="Active window")
-    axes[0].set_title("Full Recording — Noisy vs Denoised  (blue = noisy,  red = denoised)")
-    axes[0].set_ylabel("Amplitude")
-    axes[0].set_xlabel("Time (ms)")
-    axes[0].legend(loc="upper right", fontsize=9)
-    axes[0].grid(True, alpha=0.3)
-
-    # ------------------------------------------------------------------ #
-    # Panel 2 — Zoomed into active window: noisy + denoised overlaid
-    #            This is where the model's work is visible
-    # ------------------------------------------------------------------ #
-    axes[1].plot(t_zoom, full_signal[zoom_start : zoom_end + 1],
-                 color="#4c9be8", linewidth=0.6, alpha=0.7, label="Noisy input")
-    axes[1].plot(t_zoom, output_full[zoom_start : zoom_end + 1],
-                 color="#e05c5c", linewidth=0.8, label="Denoised output")
-    axes[1].axvspan(start / sr * 1000, end / sr * 1000,
-                    alpha=0.12, color="green", label="Active window")
-    axes[1].set_title(
-        f"Zoomed — Active Window  ({start/sr*1000:.1f} – {end/sr*1000:.1f} ms)"
-        "  ← changes made by the model are visible here"
-    )
-    axes[1].set_ylabel("Amplitude")
-    axes[1].set_xlabel("Time (ms)")
-    axes[1].legend(loc="upper right", fontsize=9)
-    axes[1].grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    log.info("Plot saved → %s", save_path)
-    plt.show()
-    plt.close(fig)
-
-
-# --------------------------------------------------------------------------- #
-# Core inference function
-# --------------------------------------------------------------------------- #
-
-def run_inference(
-    cfg: Config,
-    source: str,
-    checkpoint_path: str,
-    input_path: str,
-    output_dir: str,
-    manual_start_ms: float = -1.0,
-    manual_end_ms: float   = -1.0,
-) -> None:
-    """
-    Load the model and run denoising on a single .dat file.
-
-    For source="synthetic":
-        Loads the file at SIGNAL_LENGTH, denoises, plots result.
-
-    For source="trial":
-        Loads the full recording, finds the active signal+noise window
-        (auto via energy detection, or manually via manual_start_ms/end_ms),
-        denoises that window, reconstructs the full-length output with zeros
-        outside the active region.
-
-    Parameters
-    ----------
-    manual_start_ms, manual_end_ms : float
-        If both ≥ 0, bypass auto-detection and use this time window (ms).
-        Use this when bursty acoustic noise causes the energy detector to
-        flag the entire file.  Set to -1.0 (default) for auto-detection.
-    """
-    ensure_dir(output_dir)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    log.info("=" * 60)
-    log.info("INFERENCE SUMMARY")
-    log.info("  Source     : %s", source.upper())
-    log.info("  Input file : %s", input_path)
-    log.info("  Checkpoint : %s", checkpoint_path)
-    log.info("  Device     : %s", device)
-    log.info("=" * 60)
-
-    # ------------------------------------------------------------------ #
-    # Load model (shared for both sources)
-    # ------------------------------------------------------------------ #
-    model = Configurable1DUNet(cfg).to(device)
-    _load_checkpoint(checkpoint_path, model, cfg)
-    model.eval()
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # ================================================================== #
-    # SYNTHETIC path — simple: load SIGNAL_LENGTH samples, denoise, plot
-    # ================================================================== #
-    if source == "synthetic":
-        raw_signal = load_dat_file(input_path, expected_length=cfg.SIGNAL_LENGTH)
-        normalised, sig_mean, sig_std = normalize_signal(raw_signal)
-        x = to_tensor(normalised).unsqueeze(0).to(device)   # (1, 1, L)
-
-        with torch.no_grad():
-            y = model(x)
-
-        denoised_norm = y.squeeze().cpu().numpy()
-        denoised_raw  = denormalize_signal(denoised_norm, sig_mean, sig_std)
-
-        input_energy    = float(np.mean(raw_signal ** 2))
-        residual        = raw_signal - denoised_raw
-        residual_energy = float(np.mean(residual ** 2)) + 1e-12
-        snr_proxy_db    = 10.0 * np.log10(input_energy / residual_energy)
-
-        log.info("Input energy   : %.6f", input_energy)
-        log.info("Output energy  : %.6f", float(np.mean(denoised_raw ** 2)))
-        log.info("SNR proxy (dB) : %.2f dB", snr_proxy_db)
-
-        png_path = os.path.join(output_dir, f"{ts}_synthetic_result.png")
-        _plot_results(
-            raw_signal=raw_signal,
-            denoised=denoised_raw,
-            residual=residual,
-            snr_db=snr_proxy_db,
-            source=source,
-            input_path=input_path,
-            save_path=png_path,
-        )
-        log.info("Plot saved → %s", png_path)
-
-    # ================================================================== #
-    # TRIAL path
-    # ================================================================== #
+    if is_trial:
+        ext_dict = extract_active_region(raw_signal, config, target_length=config.TRIAL_SIGNAL_LENGTH)
+        eval_signal = ext_dict["active"]
+        noise_ref = ext_dict["noise"]
+        active_bounds = (ext_dict["start"], ext_dict["end"])
     else:
-        sr = cfg.TRIAL_SAMPLE_RATE          # 17,800 Hz
-
-        # Step 1: Load the full trial file
-        full_signal = load_dat_file(input_path)
-        n_samples   = len(full_signal)
-        log.info("Loaded: %d samples  (%.1f ms at %.0f Hz)",
-                 n_samples, n_samples / sr * 1000, sr)
-
-        # Step 2: Determine active window
-        #   Option A — Manual override (use when bursty noise defeats auto-detection)
-        #   Option B — Auto energy-based extraction
-        from utils import compute_rms_envelope, estimate_noise_floor, detect_active_region
-
-        if manual_start_ms >= 0.0 and manual_end_ms >= 0.0:
-            # Manual override: convert ms → samples, clamp to file bounds
-            start = int(max(0,             manual_start_ms * sr / 1000.0))
-            end   = int(min(n_samples - 1, manual_end_ms   * sr / 1000.0))
-            log.info("Manual window: %d – %d  (%.1f – %.1f ms) [override active]",
-                     start, end, start / sr * 1000, end / sr * 1000)
+        if len(raw_signal) != config.SIGNAL_LENGTH:
+            eval_signal = load_dat_file(input_path, expected_length=config.SIGNAL_LENGTH)
         else:
-            # Auto-detection using energy threshold
-            rms         = compute_rms_envelope(full_signal, cfg.TRIAL_RMS_WINDOW)
-            noise_floor = estimate_noise_floor(rms, cfg.EXTRACTION_NOISE_PERCENTILE)
-            threshold   = cfg.EXTRACTION_THRESHOLD_FACTOR * noise_floor
-            start, end  = detect_active_region(
-                rms, noise_floor,
-                cfg.EXTRACTION_THRESHOLD_FACTOR,
-                cfg.TRIAL_PAD_SAMPLES,
-                n_samples,
-            )
-            log.info("Noise floor: %.5f  |  Threshold: %.5f  |  RMS peak: %.5f",
-                     noise_floor, threshold, rms.max())
-            log.info("Active region: %d – %d  (%.1f – %.1f ms)",
-                     start, end, start / sr * 1000, end / sr * 1000)
+            eval_signal = raw_signal
+        if clean_path and os.path.isfile(clean_path):
+            clean_signal = load_dat_file(clean_path, expected_length=config.SIGNAL_LENGTH)
+        noise_ref = None
+        active_bounds = (0, len(eval_signal))
 
-        # Step 3: Slice and pad/truncate to TRIAL_SIGNAL_LENGTH
-        window      = full_signal[start : end + 1]
-        target_len  = cfg.TRIAL_SIGNAL_LENGTH
-        if len(window) >= target_len:
-            active = window[:target_len].copy()
+    # 3. Stage 1: Detector Evaluation
+    det_ckpt_path = detector_checkpoint or config.DETECTOR_CHECKPOINT
+    detector_verdict = "Detector checkpoint not loaded"
+    detector_confidence = 0.0
+
+    if os.path.isfile(det_ckpt_path):
+        try:
+            det_model = SignalDetectorCNN(cfg=config).to(dev)
+            det_ckpt = torch.load(det_ckpt_path, map_location=dev)
+            det_model.load_state_dict(det_ckpt["model_state_dict"])
+            det_model.eval()
+
+            # Normalize for detector input
+            det_norm, _, _ = normalize_signal(eval_signal)
+            det_tensor = to_tensor(det_norm).to(dev)
+            preds, probs = det_model.predict(det_tensor)
+            pred_class = int(preds[0].item())
+            prob_signal = float(probs[0, 1].item())
+            detector_confidence = prob_signal
+            verdict_text = "Pulse Present" if pred_class == 1 else "Noise Only"
+            detector_verdict = f"{verdict_text} (Conf: {prob_signal * 100.0:.1f}%)"
+            logger.info("Detector Stage: %s", detector_verdict)
+        except Exception as e:
+            logger.warning("Failed evaluating detector: %s", e)
+    else:
+        logger.info("Detector checkpoint not found at %s. Skipping Stage 1.", det_ckpt_path)
+
+    if checkpoint:
+        unet_ckpt_path = checkpoint
+    else:
+        if model_type is None:
+            if is_trial and os.path.isfile(config.UNET_FINETUNED_CHECKPOINT):
+                model_type = "finetuned"
+            else:
+                model_type = "pretrained"
+
+        if model_type.lower() == "finetuned":
+            unet_ckpt_path = config.UNET_FINETUNED_CHECKPOINT
         else:
-            active = np.pad(window, (0, target_len - len(window)), mode="constant")
-        log.info("Window length: %d samples → padded/truncated to %d",
-                 len(window), target_len)
+            unet_ckpt_path = config.UNET_PRETRAINED_CHECKPOINT
 
-        # Step 4: Normalise → model → denormalise
-        active_norm, act_mean, act_std = normalize_signal(active)
-        x = to_tensor(active_norm).unsqueeze(0).to(device)   # (1, 1, TRIAL_SIGNAL_LENGTH)
-
-        with torch.no_grad():
-            y = model(x)
-
-        denoised_norm   = y.squeeze().cpu().numpy()[:target_len]
-        denoised_active = denormalize_signal(denoised_norm, act_mean, act_std)
-
-        # Step 5: Reconstruct full-length output (zeros outside, denoised inside)
-        output_full = np.zeros_like(full_signal)
-        active_len  = min(end - start + 1, target_len)
-        output_full[start : start + active_len] = denoised_active[:active_len]
-
-        # SNR proxy on the active region
-        active_input    = full_signal[start : start + active_len]
-        residual_active = active_input - denoised_active[:active_len]
-        input_energy    = float(np.mean(active_input ** 2))
-        residual_energy = float(np.mean(residual_active ** 2)) + 1e-12
-        snr_proxy_db    = 10.0 * np.log10(input_energy / residual_energy)
-        log.info("Active region SNR proxy: %.2f dB", snr_proxy_db)
-
-        # Step 6: Plot
-        png_path = os.path.join(output_dir, f"{ts}_trial_result.png")
-        _plot_trial_results(
-            full_signal=full_signal,
-            output_full=output_full,
-            active_input=active_input,
-            denoised_active=denoised_active[:active_len],
-            start=start,
-            end=end,
-            snr_db=snr_proxy_db,
-            cfg=cfg,
-            input_path=input_path,
-            save_path=png_path,
+    if not os.path.isfile(unet_ckpt_path):
+        raise FileNotFoundError(
+            f"Denoiser checkpoint not found at: {unet_ckpt_path}. "
+            "Please train or pretrain the model first."
         )
-        log.info("Plot saved → %s", png_path)
+
+    logger.info("Loading U-Net denoiser weights from %s", unet_ckpt_path)
+    denoiser = Configurable1DUNet(cfg=config).to(dev)
+    ckpt = torch.load(unet_ckpt_path, map_location=dev)
+    denoiser.load_state_dict(ckpt["model_state_dict"])
+    denoiser.eval()
+
+    # Normalize input
+    norm_input, mean_val, std_val = normalize_signal(eval_signal)
+    input_tensor = to_tensor(norm_input).to(dev)
+
+    with torch.no_grad():
+        output_tensor = denoiser(input_tensor)
+
+    denoised_norm = output_tensor.squeeze().cpu().numpy()
+    denoised_signal = denormalize_signal(denoised_norm, mean_val, std_val)
+
+    # 5. Compute SNR Metrics
+    snr_improvement = 0.0
+    if clean_signal is not None:
+        snr_in = calculate_snr_db(clean_signal, eval_signal - clean_signal)
+        snr_out = calculate_snr_db(clean_signal, denoised_signal - clean_signal)
+        snr_improvement = snr_out - snr_in
+        logger.info("Ground Truth Evaluation: Input SNR=%.2f dB, Output SNR=%.2f dB, Gain=%+.2f dB", snr_in, snr_out, snr_improvement)
+    else:
+        # Unsupervised estimate: compare signal-to-noise ratio before and after denoising
+        # Finds the quietest background noise segment via extract_noise_reference
+        w_ref = min(500, len(eval_signal) // 4)
+        p_noise_in = float(np.mean(extract_noise_reference(eval_signal, w_ref) ** 2)) + 1e-12
+        p_noise_out = float(np.mean(extract_noise_reference(denoised_signal, w_ref) ** 2)) + 1e-12
+        p_sig_in = float(np.mean(eval_signal ** 2))
+        p_sig_out = float(np.mean(denoised_signal ** 2))
+
+        est_snr_in = float(10.0 * np.log10(max(p_sig_in - p_noise_in, 1e-8) / p_noise_in))
+        est_snr_out = float(10.0 * np.log10(max(p_sig_out - p_noise_out, 1e-8) / p_noise_out))
+        snr_improvement = est_snr_out - est_snr_in
+        logger.info("Estimated SNR Gain: %+.2f dB", snr_improvement)
+
+    # 6. Save Denoised Output as Plain-Text .dat
+    ensure_dir(config.INFERENCE_OUTPUT_DIR)
+    out_dat_path = os.path.join(config.INFERENCE_OUTPUT_DIR, f"{base_name}_denoised.dat")
+    save_dat_file(out_dat_path, denoised_signal)
+    logger.info("Saved denoised output to: %s", out_dat_path)
+
+    # 7. Generate Visual Diagnostic Plot (Lazy matplotlib import, Agg backend)
+    plot_path = None
+    if save_plot:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from scipy.signal import welch
+
+            plot_path = os.path.join(config.INFERENCE_OUTPUT_DIR, f"{base_name}_analysis.png")
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7))
+
+            # Subplot 1: Time Series
+            fs = config.TRIAL_SAMPLE_RATE if is_trial else config.SAMPLE_RATE
+            t = np.arange(len(eval_signal)) / fs * 1000.0  # ms
+            ax1.plot(t, eval_signal, color="#b0bec5", alpha=0.8, label="Input Noisy")
+            if clean_signal is not None:
+                ax1.plot(t, clean_signal, color="#2e7d32", alpha=0.5, linestyle="--", label="Ground Truth Clean")
+            ax1.plot(t, denoised_signal, color="#1565c0", linewidth=1.2, label=f"Denoised ({model_type})")
+            ax1.set_title(f"Acoustic Time Series [{base_name}] | Detector: {detector_verdict}", fontsize=11, fontweight="bold")
+            ax1.set_xlabel("Time (ms)")
+            ax1.set_ylabel("Amplitude")
+            ax1.grid(True, linestyle=":", alpha=0.6)
+            ax1.legend(loc="upper right")
+
+            # Subplot 2: Power Spectral Density (PSD)
+            nperseg = min(512, len(eval_signal))
+            f_noisy, psd_noisy = welch(eval_signal, fs=fs, nperseg=nperseg)
+            f_denoised, psd_denoised = welch(denoised_signal, fs=fs, nperseg=nperseg)
+
+            ax2.semilogy(f_noisy / 1000.0, psd_noisy, color="#b0bec5", label="Noisy PSD")
+            if clean_signal is not None:
+                f_clean, psd_clean = welch(clean_signal, fs=fs, nperseg=nperseg)
+                ax2.semilogy(f_clean / 1000.0, psd_clean, color="#2e7d32", linestyle="--", label="Clean PSD")
+            ax2.semilogy(f_denoised / 1000.0, psd_denoised, color="#1565c0", label="Denoised PSD")
+            ax2.set_title(f"Power Spectral Density (Welch) | Estimated SNR Gain: {snr_improvement:+.2f} dB", fontsize=11, fontweight="bold")
+            ax2.set_xlabel("Frequency (kHz)")
+            ax2.set_ylabel("PSD (V^2 / Hz)")
+            ax2.grid(True, linestyle=":", alpha=0.6)
+            ax2.legend(loc="upper right")
+
+            plt.tight_layout()
+            try:
+                plt.savefig(plot_path, dpi=150)
+            except OSError:
+                plot_path = os.path.join(config.INFERENCE_OUTPUT_DIR, f"{base_name}_analysis_latest.png")
+                plt.savefig(plot_path, dpi=150)
+            plt.close(fig)
+            logger.info("Saved diagnostic plot to: %s", plot_path)
+
+            if show_plot and plot_path and os.path.isfile(plot_path):
+                if sys.platform.startswith("win"):
+                    try:
+                        os.startfile(plot_path)
+                    except Exception as ex:
+                        logger.debug("Could not open plot in image viewer: %s", ex)
+        except Exception as e:
+            logger.warning("Could not generate diagnostic plot: %s", e)
+
+    return {
+        "input_path": input_path,
+        "output_dat": out_dat_path,
+        "output_plot": plot_path,
+        "detector_verdict": detector_verdict,
+        "detector_confidence": detector_confidence,
+        "snr_improvement": snr_improvement,
+        "is_trial": is_trial,
+    }
 
 
+def main():
+    parser = argparse.ArgumentParser(description="Acoustic Pipeline Detection and Denoising Inference")
+    parser.add_argument("--source", type=str, default="synthetic", help="Source: 'synthetic', 'trial', or direct file path")
+    parser.add_argument("--pri", type=str, default=None, help="Trial PRI folder (e.g. 'PRI_01')")
+    parser.add_argument("--channel", type=str, default=None, help="Trial channel file (e.g. 'channel001.dat')")
+    parser.add_argument("--model", type=str, choices=["pretrained", "finetuned"], default=None, help="U-Net checkpoint stage")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Explicit denoiser checkpoint path")
+    parser.add_argument("--detector-checkpoint", type=str, default=None, help="Explicit detector checkpoint path")
+    parser.add_argument("--device", type=str, default=None, help="Device (cpu/cuda)")
+    parser.add_argument("--show-plot", action="store_true", help="Open generated diagnostic plot in viewer")
+    args = parser.parse_args()
 
-
-# --------------------------------------------------------------------------- #
-# CLI
-def _parse_args():
-    parser = argparse.ArgumentParser(
-        description=(
-            "NSTL Acoustic Denoiser — Inference\n\n"
-            "You MUST specify --source to avoid accidentally applying a\n"
-            "synthetic-pretrained model to trial data or vice versa.\n\n"
-            "Examples:\n"
-            "  python inference.py --source synthetic\n"
-            "  python inference.py --source trial --pri pri01 --channel 0\n"
-            "  python inference.py --source synthetic --file data/synthetic/noisy/s1.dat\n"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+    run_pipeline(
+        source=args.source,
+        pri=args.pri,
+        channel=args.channel,
+        model_type=args.model,
+        checkpoint=args.checkpoint,
+        detector_checkpoint=args.detector_checkpoint,
+        device=args.device,
+        show_plot=args.show_plot,
     )
-    parser.add_argument(
-        "--source",
-        choices=["synthetic", "trial"],
-        default=None,
-        help=(
-            "Data source for inference. "
-            "'synthetic' uses the pretrained checkpoint. "
-            "'trial' prefers the fine-tuned checkpoint (falls back to pretrained with warning)."
-        ),
-    )
-    parser.add_argument(
-        "--file",
-        default=None,
-        metavar="PATH",
-        help="Explicit path to a .dat file. Overrides automatic file selection.",
-    )
-    parser.add_argument(
-        "--pri",
-        default=None,
-        metavar="PRI",
-        help=(
-            "Trial PRI folder (e.g. pri01). Used when --source=trial and --file is not given. "
-            "Defaults to Config.INFERENCE_TRIAL_PRI."
-        ),
-    )
-    parser.add_argument(
-        "--channel",
-        type=int,
-        default=None,
-        metavar="N",
-        help=(
-            "Trial channel index (0-based). Used when --source=trial and --file is not given. "
-            "Defaults to Config.INFERENCE_TRIAL_CHANNEL."
-        ),
-    )
-    parser.add_argument(
-        "--checkpoint",
-        default=None,
-        metavar="PATH",
-        help="Explicit checkpoint path.  Overrides automatic checkpoint selection.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=None,
-        metavar="DIR",
-        help="Directory to save output arrays.  Defaults to Config.INFERENCE_OUTPUT_DIR.",
-    )
-    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    args = _parse_args()
-    cfg = Config()
-    set_seed(cfg.RANDOM_SEED)
-
-    # ------------------------------------------------------------------ #
-    # Source must be explicit
-    # ------------------------------------------------------------------ #
-    if args.source is None:
-        log.info(
-            "No --source specified.  Using default from Config: '%s'.",
-            cfg.INFERENCE_DEFAULT_SOURCE,
-        )
-        source = cfg.INFERENCE_DEFAULT_SOURCE
-    else:
-        source = args.source
-
-    # ------------------------------------------------------------------ #
-    # Resolve checkpoint
-    # ------------------------------------------------------------------ #
-    checkpoint_path = _resolve_checkpoint(cfg, source, args.checkpoint)
-
-    # ------------------------------------------------------------------ #
-    # Resolve input file
-    # ------------------------------------------------------------------ #
-    if args.file:
-        input_path = args.file
-        if not os.path.isfile(input_path):
-            log.error("--file not found: %s", input_path)
-            sys.exit(1)
-    elif source == "synthetic":
-        input_path = _resolve_synthetic_file(cfg)
-    else:  # trial
-        pri = args.pri if args.pri is not None else cfg.INFERENCE_TRIAL_PRI
-        channel = args.channel if args.channel is not None else cfg.INFERENCE_TRIAL_CHANNEL
-        input_path = _resolve_trial_file(cfg, pri, channel)
-
-    # ------------------------------------------------------------------ #
-    # Output directory
-    # ------------------------------------------------------------------ #
-    output_dir = args.output_dir if args.output_dir else cfg.INFERENCE_OUTPUT_DIR
-
-    # ------------------------------------------------------------------ #
-    # Run
-    # ------------------------------------------------------------------ #
-    run_inference(cfg, source, checkpoint_path, input_path, output_dir)
+    main()

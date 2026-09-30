@@ -1,108 +1,115 @@
 """
-Better 3-panel visualization:
-  Panel 1 — Noisy input (0-200ms), full scale
-  Panel 2 — Denoised output, auto-scaled so you can see structure
-  Panel 3 — Removed noise = noisy - denoised  (what the model suppressed)
+Headless End-to-End Test for Detection & Denoising Inference Pipeline.
+Runs completely headless without requiring an interactive display or GUI window.
 """
 
-import os, sys
+import os
+import sys
+import tempfile
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import torch
 
-sys.path.insert(0, r"C:\Users\HARSHA\.gemini\antigravity\scratch\nstl_acoustic")
+try:
+    from .config import Config
+    from .utils import load_dat_file, save_dat_file, ensure_dir
+    from .detector import SignalDetectorCNN
+    from .unet import Configurable1DUNet
+    from .inference import run_pipeline
+except (ImportError, ValueError):
+    from config import Config
+    from utils import load_dat_file, save_dat_file, ensure_dir
+    from detector import SignalDetectorCNN
+    from unet import Configurable1DUNet
+    from inference import run_pipeline
 
-from config import Config
-from unet import Configurable1DUNet
-from denoiser_finetune import _load_checkpoint
-from utils import load_dat_file, normalize_signal, set_seed
 
-def to_tensor(x):
-    return torch.from_numpy(x.astype(np.float32)).unsqueeze(0)
+def test_headless_inference_end_to_end():
+    """
+    Test headless execution of inference on both synthetic and trial sources.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cfg = Config(
+            SYNTHETIC_DATA_DIR=os.path.join(tmp_dir, "synthetic"),
+            TRIAL_DATA_DIR=os.path.join(tmp_dir, "trial"),
+            DETECTOR_DATA_DIR=os.path.join(tmp_dir, "detector"),
+            MODELS_DIR=os.path.join(tmp_dir, "models"),
+            DETECTOR_CHECKPOINT=os.path.join(tmp_dir, "models", "detector_best.pth"),
+            UNET_PRETRAINED_CHECKPOINT=os.path.join(tmp_dir, "models", "unet_pretrained_best.pth"),
+            UNET_FINETUNED_CHECKPOINT=os.path.join(tmp_dir, "models", "unet_finetuned_best.pth"),
+            INFERENCE_OUTPUT_DIR=os.path.join(tmp_dir, "inference_output"),
+        )
+        ensure_dir(cfg.MODELS_DIR)
 
-cfg    = Config()
-sr     = cfg.TRIAL_SAMPLE_RATE   # 17,800 Hz
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-set_seed(cfg.RANDOM_SEED)
+        # 1. Create a dummy synthetic sample
+        synth_clean_dir = os.path.join(cfg.SYNTHETIC_DATA_DIR, cfg.SYNTHETIC_CLEAN_SUBDIR)
+        synth_noisy_dir = os.path.join(cfg.SYNTHETIC_DATA_DIR, cfg.SYNTHETIC_NOISY_SUBDIR)
+        ensure_dir(synth_clean_dir)
+        ensure_dir(synth_noisy_dir)
 
-# Load pretrained model
-model = Configurable1DUNet(cfg).to(device)
-_load_checkpoint(cfg.UNET_PRETRAINED_CHECKPOINT, model, cfg)
-model.eval()
+        t = np.linspace(0, 0.25, cfg.SIGNAL_LENGTH, dtype=np.float32)
+        clean_sig = np.sin(2 * np.pi * 20000 * t)
+        noisy_sig = clean_sig + 0.2 * np.random.randn(len(t)).astype(np.float32)
 
-# Load real trial file
-trial_file = r"C:\Users\HARSHA\Downloads\TransferNow-20260922dMEzqqdd\pri\channel001.dat"
-full_signal = load_dat_file(trial_file)
-n = len(full_signal)
+        save_dat_file(os.path.join(synth_clean_dir, "synth_test.dat"), clean_sig)
+        save_dat_file(os.path.join(synth_noisy_dir, "synth_test.dat"), noisy_sig)
 
-# Manual window 0-200ms
-start = 0
-end   = int(200.0 * sr / 1000.0)
-end   = min(end, n - 1)
+        # 2. Create dummy checkpoints
+        det = SignalDetectorCNN(cfg=cfg)
+        torch.save({
+            "tag": "detector",
+            "model_state_dict": det.state_dict(),
+            "config": {"features": cfg.DETECTOR_FEATURES},
+        }, cfg.DETECTOR_CHECKPOINT)
 
-window     = full_signal[start : end + 1]
-target_len = cfg.TRIAL_SIGNAL_LENGTH
-active     = np.pad(window, (0, max(0, target_len - len(window))), mode="constant") if len(window) < target_len else window[:target_len].copy()
+        unet = Configurable1DUNet(cfg=cfg)
+        torch.save({
+            "tag": "pretrained",
+            "model_state_dict": unet.state_dict(),
+            "unet_config": cfg.UNET_CONFIG,
+            "signal_length": cfg.SIGNAL_LENGTH,
+        }, cfg.UNET_PRETRAINED_CHECKPOINT)
 
-active_norm, act_mean, act_std = normalize_signal(active)
-x = to_tensor(active_norm).unsqueeze(0).to(device)
+        # 3. Test Synthetic Headless Inference
+        res_synth = run_pipeline(
+            source="synthetic",
+            model_type="pretrained",
+            cfg=cfg,
+            save_plot=True,
+            device="cpu",
+        )
 
-with torch.no_grad():
-    y = model(x)
+        assert os.path.isfile(res_synth["output_dat"]), f"Missing output dat: {res_synth['output_dat']}"
+        assert os.path.isfile(res_synth["output_plot"]), f"Missing plot: {res_synth['output_plot']}"
+        denoised_data = load_dat_file(res_synth["output_dat"])
+        assert len(denoised_data) == cfg.SIGNAL_LENGTH, f"Length mismatch: {len(denoised_data)} vs {cfg.SIGNAL_LENGTH}"
+        assert "Pulse Present" in res_synth["detector_verdict"] or "Noise Only" in res_synth["detector_verdict"]
+        assert os.path.getsize(res_synth["output_plot"]) > 1000
 
-denoised_norm   = y.squeeze().cpu().numpy()[:len(active)]
-denoised_active = denoised_norm * act_std + act_mean
+        # 4. Test Trial Headless Inference
+        trial_sig_dir = os.path.join(cfg.TRIAL_DATA_DIR, cfg.TRIAL_SIGNAL_SUBDIR, cfg.INFERENCE_TRIAL_PRI)
+        ensure_dir(trial_sig_dir)
+        trial_raw = 0.1 * np.random.randn(19299).astype(np.float32)
+        # Inject pulse
+        trial_raw[6000:8011] += np.sin(2 * np.pi * 5000 * np.linspace(0, 0.113, 2011)).astype(np.float32)
+        trial_file = os.path.join(trial_sig_dir, cfg.INFERENCE_TRIAL_CHANNEL)
+        save_dat_file(trial_file, trial_raw)
 
-active_len     = min(end - start + 1, target_len)
-active_input   = full_signal[start : start + active_len]
-denoised_out   = denoised_active[:active_len]
-removed_noise  = active_input - denoised_out
+        res_trial = run_pipeline(
+            source="trial",
+            model_type="pretrained",
+            cfg=cfg,
+            save_plot=True,
+            device="cpu",
+        )
 
-t_zoom = np.arange(active_len) / sr * 1000.0   # ms
+        assert os.path.isfile(res_trial["output_dat"])
+        assert os.path.isfile(res_trial["output_plot"])
+        denoised_trial = load_dat_file(res_trial["output_dat"])
+        assert len(denoised_trial) == cfg.TRIAL_SIGNAL_LENGTH
+        assert os.path.getsize(res_trial["output_plot"]) > 1000
 
-snr_db = 10.0 * np.log10(np.mean(active_input**2) / (np.mean(removed_noise**2) + 1e-12))
-print(f"SNR proxy: {snr_db:.2f} dB")
-print(f"Input    amplitude: {active_input.min():.1f} to {active_input.max():.1f}")
-print(f"Denoised amplitude: {denoised_out.min():.1f}   to {denoised_out.max():.1f}")
-print(f"Removed  amplitude: {removed_noise.min():.1f} to {removed_noise.max():.1f}")
+        print("\nAll headless inference tests passed successfully.")
 
-# ── 3-panel plot ────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(3, 1, figsize=(14, 10))
-fig.suptitle(
-    f"NSTL Trial Inference — channel001.dat  [PRETRAINED]\n"
-    f"0-200 ms (LFM signal region)  |  SNR proxy: {snr_db:.2f} dB",
-    fontsize=11, fontweight="bold",
-)
 
-# Panel 1: Noisy input full scale
-axes[0].plot(t_zoom, active_input, color="#4c9be8", lw=0.6, alpha=0.8)
-axes[0].set_title("Noisy Input  (full amplitude scale — dominated by impulsive noise bursts)")
-axes[0].set_ylabel("Amplitude")
-axes[0].grid(True, alpha=0.3)
-
-# Panel 2: Denoised output — auto-scaled to show signal structure
-axes[1].plot(t_zoom, denoised_out, color="#e05c5c", lw=0.8)
-axes[1].set_title("Denoised Output  (auto-scaled — noise bursts removed, signal structure visible)")
-axes[1].set_ylabel("Amplitude")
-axes[1].grid(True, alpha=0.3)
-
-# Overlay them on Panel 2 with clipped y-axis to compare
-perc = np.percentile(np.abs(denoised_out), 99)
-ylim = max(perc * 2, 1.0)
-axes[1].set_ylim(-ylim * 3, ylim * 3)
-
-# Panel 3: Noise removed by model
-axes[2].plot(t_zoom, removed_noise, color="#888888", lw=0.5, alpha=0.7)
-axes[2].set_title("Removed Noise  (noisy - denoised) — impulsive spikes the model suppressed")
-axes[2].set_ylabel("Amplitude")
-axes[2].set_xlabel("Time (ms)")
-axes[2].grid(True, alpha=0.3)
-
-plt.tight_layout()
-os.makedirs("inference_output", exist_ok=True)
-out = "inference_output/pretrained_REAL_3panel.png"
-plt.savefig(out, dpi=150, bbox_inches="tight")
-plt.close(fig)
-print(f"PLOT SAVED -> {out}")
+if __name__ == "__main__":
+    test_headless_inference_end_to_end()

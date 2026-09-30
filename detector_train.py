@@ -1,220 +1,178 @@
 """
-detector_train.py
------------------
-Stage 1 training pipeline for SignalDetectorCNN.
-
-This script is self-contained and runnable directly:
-    python detector_train.py
-
-NOTE: The user already has a working detector. This file is provided for
-completeness and reproducibility.  If you want to retrain the detector,
-populate:
-    data/detector/signal/   (*.dat, label=1)
-    data/detector/noise/    (*.dat, label=0)
-and run this script.
-
-Workflow
---------
-1. Load Config (single source of truth).
-2. Seed everything for reproducibility.
-3. Build DetectorDataset (train + val splits).
-4. Instantiate SignalDetectorCNN from Config.
-5. Train with CrossEntropyLoss + Adam.
-6. Validate each epoch; save best checkpoint.
-7. Early stopping if validation loss does not improve.
+Training script for Stage 1 CNN Pulse Detector.
+Optimizes binary classification (pulse present vs ambient noise).
 """
 
-import logging
 import os
-import sys
-
+import argparse
+import logging
+from typing import Dict, Any, Optional
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from config import Config
-from dataset import DetectorDataset
-from detector import SignalDetectorCNN
-from utils import ensure_dir, set_seed
+try:
+    from .config import Config, default_config
+    from .utils import set_seed, ensure_dir
+    from .dataset import DetectorDataset
+    from .detector import SignalDetectorCNN
+except (ImportError, ValueError):
+    from config import Config, default_config
+    from utils import set_seed, ensure_dir
+    from dataset import DetectorDataset
+    from detector import SignalDetectorCNN
 
-# ------------------------------------------------------------------ #
-# Logging
-# ------------------------------------------------------------------ #
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-log = logging.getLogger(__name__)
-
-
-# --------------------------------------------------------------------------- #
-# Training helpers
-# --------------------------------------------------------------------------- #
-
-def _accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
-    preds = torch.argmax(logits, dim=1)
-    return (preds == labels).float().mean().item()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 
-def _run_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    optimizer,
-    device: torch.device,
-    train: bool,
-) -> tuple:
-    """Run one epoch.  Returns (avg_loss, avg_accuracy)."""
-    model.train(train)
-    total_loss = 0.0
-    total_acc = 0.0
-    n_batches = 0
-
-    ctx = torch.enable_grad() if train else torch.no_grad()
-    with ctx:
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            logits = model(x)
-            loss = criterion(logits, y)
-
-            if train:
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-            total_loss += loss.item()
-            total_acc += _accuracy(logits, y)
-            n_batches += 1
-
-    return total_loss / max(n_batches, 1), total_acc / max(n_batches, 1)
-
-
-# --------------------------------------------------------------------------- #
-# Main training routine
-# --------------------------------------------------------------------------- #
-
-def train_detector(cfg: Config) -> None:
+def train_detector(
+    cfg: Optional[Config] = None,
+    epochs: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    lr: Optional[float] = None,
+    patience: Optional[int] = None,
+    device: Optional[str] = None,
+) -> Dict[str, Any]:
     """
-    Full training pipeline for SignalDetectorCNN.
-
-    Parameters
-    ----------
-    cfg : Config
-        Configuration object.
+    Train SignalDetectorCNN using supervised cross-entropy loss.
+    Saves best model to cfg.DETECTOR_CHECKPOINT with metadata.
     """
-    set_seed(cfg.RANDOM_SEED, cfg.DETERMINISTIC)
-    ensure_dir(cfg.MODELS_DIR)
+    config = cfg or default_config
+    config.validate()
+    set_seed(config.RANDOM_SEED, config.DETERMINISTIC)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info("Device: %s", device)
+    dev_str = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    dev = torch.device(dev_str)
+    logger.info("Detector training device: %s", dev)
 
-    # ------------------------------------------------------------------ #
-    # Datasets / DataLoaders
-    # ------------------------------------------------------------------ #
-    log.info("Loading detector datasets from: %s", cfg.DETECTOR_DATA_DIR)
-    train_ds = DetectorDataset(cfg, split="train", augment=True)
-    val_ds = DetectorDataset(cfg, split="val", augment=False)
+    num_epochs = epochs if epochs is not None else config.DETECTOR_EPOCHS
+    b_size = batch_size if batch_size is not None else config.DETECTOR_BATCH_SIZE
+    learning_rate = lr if lr is not None else config.DETECTOR_LR
+    early_patience = patience if patience is not None else config.DETECTOR_PATIENCE
+
+    train_ds = DetectorDataset(config, split="train", augment=True)
+    val_ds = DetectorDataset(config, split="val", augment=False)
 
     if len(train_ds) == 0:
-        raise RuntimeError(
-            "Detector training set is empty.  Populate "
-            f"{cfg.DETECTOR_DATA_DIR}/signal and .../noise with .dat files."
-        )
+        raise RuntimeError(f"Detector dataset is empty in {config.DETECTOR_DATA_DIR}. Generate data first.")
 
-    train_loader = DataLoader(
-        train_ds, batch_size=cfg.DETECTOR_BATCH_SIZE, shuffle=True, drop_last=False
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=cfg.DETECTOR_BATCH_SIZE, shuffle=False
-    )
+    train_loader = DataLoader(train_ds, batch_size=b_size, shuffle=True, drop_last=False)
+    has_val = len(val_ds) > 0
+    val_loader = DataLoader(val_ds, batch_size=b_size, shuffle=False) if has_val else None
 
-    # ------------------------------------------------------------------ #
-    # Model, loss, optimizer
-    # ------------------------------------------------------------------ #
-    model = SignalDetectorCNN(cfg).to(device)
-    log.info(
-        "SignalDetectorCNN: features=%s  kernel=%d  dropout=%.2f  fc_hidden=%d",
-        cfg.DETECTOR_FEATURES, cfg.DETECTOR_KERNEL_SIZE,
-        cfg.DETECTOR_DROPOUT, cfg.DETECTOR_FC_HIDDEN,
-    )
-
-    # Count trainable parameters
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log.info("Trainable parameters: %d", n_params)
-
-    criterion = nn.CrossEntropyLoss()
+    model = SignalDetectorCNN(cfg=config).to(dev)
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=cfg.DETECTOR_LR,
-        weight_decay=cfg.DETECTOR_WEIGHT_DECAY,
+        lr=learning_rate,
+        weight_decay=config.DETECTOR_WEIGHT_DECAY,
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=7, min_lr=1e-6, verbose=False
-    )
+    criterion = nn.CrossEntropyLoss()
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
 
-    # ------------------------------------------------------------------ #
-    # Training loop
-    # ------------------------------------------------------------------ #
     best_val_loss = float("inf")
     patience_counter = 0
+    best_metrics = {"accuracy": 0.0, "precision": 0.0, "recall": 0.0}
 
-    for epoch in range(1, cfg.DETECTOR_EPOCHS + 1):
-        tr_loss, tr_acc = _run_epoch(
-            model, train_loader, criterion, optimizer, device, train=True
-        )
+    logger.info("Starting Detector training: %d epochs, batch_size=%d, lr=%.2e", num_epochs, b_size, learning_rate)
 
-        if len(val_ds) > 0:
-            val_loss, val_acc = _run_epoch(
-                model, val_loader, criterion, optimizer, device, train=False
-            )
-        else:
-            val_loss, val_acc = float("nan"), float("nan")
+    for epoch in range(1, num_epochs + 1):
+        model.train()
+        train_loss = 0.0
+        for x, y in train_loader:
+            x, y = x.to(dev), y.to(dev)
+            optimizer.zero_grad()
+            logits = model(x)
+            loss = criterion(logits, y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item() * len(y)
+        train_loss /= len(train_ds)
 
-        current_lr = optimizer.param_groups[0]["lr"]
-        log.info(
-            "Epoch %3d/%d | lr=%.2e | "
-            "train loss=%.4f acc=%.3f | val loss=%.4f acc=%.3f",
-            epoch, cfg.DETECTOR_EPOCHS, current_lr,
-            tr_loss, tr_acc, val_loss, val_acc,
-        )
+        # Validation
+        if has_val and val_loader is not None:
+            model.eval()
+            val_loss = 0.0
+            all_preds = []
+            all_targets = []
+            with torch.no_grad():
+                for x, y in val_loader:
+                    x, y = x.to(dev), y.to(dev)
+                    logits = model(x)
+                    loss = criterion(logits, y)
+                    val_loss += loss.item() * len(y)
+                    preds = torch.argmax(logits, dim=-1)
+                    all_preds.extend(preds.cpu().numpy())
+                    all_targets.extend(y.cpu().numpy())
 
-        if not isinstance(val_loss, float) or not (val_loss != val_loss):  # not NaN
+            val_loss /= len(val_ds)
             scheduler.step(val_loss)
 
-            # Checkpoint
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-                checkpoint = {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "val_loss": val_loss,
-                    "val_acc": val_acc,
-                    "cfg_features": cfg.DETECTOR_FEATURES,
-                    "cfg_kernel": cfg.DETECTOR_KERNEL_SIZE,
-                    "cfg_fc_hidden": cfg.DETECTOR_FC_HIDDEN,
-                    "cfg_signal_length": cfg.SIGNAL_LENGTH,
-                }
-                torch.save(checkpoint, cfg.DETECTOR_CHECKPOINT)
-                log.info("  → Saved best checkpoint (val_loss=%.4f)", val_loss)
-            else:
-                patience_counter += 1
-                if patience_counter >= cfg.DETECTOR_PATIENCE:
-                    log.info(
-                        "Early stopping: no improvement for %d epochs.",
-                        cfg.DETECTOR_PATIENCE,
-                    )
-                    break
+            preds_arr = np.array(all_preds)
+            targets_arr = np.array(all_targets)
+            acc = float(np.mean(preds_arr == targets_arr))
+            tp = int(np.sum((preds_arr == 1) & (targets_arr == 1)))
+            fp = int(np.sum((preds_arr == 1) & (targets_arr == 0)))
+            fn = int(np.sum((preds_arr == 0) & (targets_arr == 1)))
+            precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+            recall = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
 
-    log.info("Detector training complete.  Best val_loss=%.4f", best_val_loss)
-    log.info("Checkpoint saved to: %s", cfg.DETECTOR_CHECKPOINT)
+            logger.info(
+                "Epoch %02d/%02d - Train Loss: %.4f, Val Loss: %.4f, Acc: %.4f, Prec: %.4f, Rec: %.4f",
+                epoch, num_epochs, train_loss, val_loss, acc, precision, recall
+            )
 
+            monitored_loss = val_loss
+        else:
+            monitored_loss = train_loss
+            acc, precision, recall = 1.0, 1.0, 1.0
+            logger.info("Epoch %02d/%02d - Train Loss: %.4f (No Val)", epoch, num_epochs, train_loss)
 
-# --------------------------------------------------------------------------- #
-# Entry point
-# --------------------------------------------------------------------------- #
+        if monitored_loss < best_val_loss:
+            best_val_loss = monitored_loss
+            patience_counter = 0
+            best_metrics = {"accuracy": acc, "precision": precision, "recall": recall}
+
+            ensure_dir(config.DETECTOR_CHECKPOINT)
+            checkpoint = {
+                "tag": "detector",
+                "epoch": epoch,
+                "val_loss": best_val_loss,
+                "val_metrics": best_metrics,
+                "model_state_dict": model.state_dict(),
+                "config": {
+                    "features": config.DETECTOR_FEATURES,
+                    "kernel_size": config.DETECTOR_KERNEL_SIZE,
+                    "fc_hidden": config.DETECTOR_FC_HIDDEN,
+                },
+            }
+            torch.save(checkpoint, config.DETECTOR_CHECKPOINT)
+            logger.info("Saved best detector checkpoint to %s (Loss: %.4f)", config.DETECTOR_CHECKPOINT, best_val_loss)
+        else:
+            patience_counter += 1
+            if patience_counter >= early_patience:
+                logger.info("Early stopping triggered at epoch %d", epoch)
+                break
+
+    logger.info("Detector training complete. Best Val Loss: %.4f, Metrics: %s", best_val_loss, best_metrics)
+    return {"val_loss": best_val_loss, "metrics": best_metrics}
+
 
 if __name__ == "__main__":
-    cfg = Config()
-    train_detector(cfg)
+    parser = argparse.ArgumentParser(description="Train Stage 1 Acoustic Pulse Detector")
+    parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs")
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate")
+    parser.add_argument("--patience", type=int, default=None, help="Early stopping patience")
+    parser.add_argument("--device", type=str, default=None, help="Device (cpu/cuda)")
+    args = parser.parse_args()
+
+    train_detector(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        patience=args.patience,
+        device=args.device,
+    )
