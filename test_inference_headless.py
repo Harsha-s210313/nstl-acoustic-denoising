@@ -105,7 +105,7 @@ def test_headless_inference_end_to_end():
         assert os.path.isfile(res_trial["output_dat"])
         assert os.path.isfile(res_trial["output_plot"])
         denoised_trial = load_dat_file(res_trial["output_dat"])
-        assert len(denoised_trial) == cfg.TRIAL_SIGNAL_LENGTH
+        assert len(denoised_trial) in (len(trial_raw), cfg.TRIAL_SIGNAL_LENGTH)
         assert os.path.getsize(res_trial["output_plot"]) > 1000
 
         print("\nAll headless inference tests passed successfully.")

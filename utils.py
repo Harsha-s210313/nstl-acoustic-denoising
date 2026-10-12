@@ -162,16 +162,23 @@ def detect_active_region(
     threshold_factor: float,
     pad_samples: int,
     signal_length: int,
+    max_len: Optional[int] = None,
 ) -> Tuple[int, int]:
     """
     Identify (start, end) index bounds of active pulse region.
+    Uses peak energy detection and contiguous expansion above threshold to avoid
+    turn-on transients or spurious noise spikes triggering false bounds.
     Pads detected region and clamps within [0, signal_length].
+    If max_len is specified and padded bounds exceed max_len, centers a max_len
+    window covering the pulse.
     Falls back to (0, signal_length) with a warning if no samples exceed threshold.
     """
     threshold = noise_floor * threshold_factor
-    active_indices = np.where(rms > threshold)[0]
+    if len(rms) == 0:
+        return 0, signal_length
 
-    if len(active_indices) == 0:
+    peak_idx = int(np.argmax(rms))
+    if rms[peak_idx] <= threshold:
         logger.warning(
             "No samples exceeded threshold (factor=%.2f, floor=%.4e). "
             "Falling back to entire signal length.",
@@ -179,11 +186,31 @@ def detect_active_region(
         )
         return 0, signal_length
 
-    raw_start = int(np.min(active_indices))
-    raw_end = int(np.max(active_indices)) + 1
+    # Contiguous expansion from highest energy peak
+    left = peak_idx
+    while left > 0 and rms[left - 1] > threshold:
+        left -= 1
+    right = peak_idx + 1
+    while right < signal_length and rms[right] > threshold:
+        right += 1
 
-    start = max(0, raw_start - pad_samples)
-    end = min(signal_length, raw_end + pad_samples)
+    start = max(0, left - pad_samples)
+    end = min(signal_length, right + pad_samples)
+
+    if max_len is not None and (end - start) > max_len:
+        span = right - left
+        if span <= max_len:
+            slack = max_len - span
+            lead = min(pad_samples, slack // 3)
+            start = max(0, left - lead)
+            end = min(signal_length, start + max_len)
+            if (end - start) < max_len and start > 0:
+                start = max(0, end - max_len)
+        else:
+            start = max(0, peak_idx - max_len // 3)
+            end = min(signal_length, start + max_len)
+            if (end - start) < max_len and start > 0:
+                start = max(0, end - max_len)
 
     return start, end
 
@@ -197,6 +224,7 @@ def extract_active_region(
     Extract active region and noise segment from a raw recording.
     Automatically selects trial vs synthetic parameters based on signal length
     or configuration if not explicitly provided.
+    Preserves exact sample alignment when input signal length <= target_length.
     Returns:
         dict with keys:
             'active': np.ndarray padded/truncated to target_length
@@ -220,7 +248,34 @@ def extract_active_region(
     rms = compute_rms_envelope(signal, rms_window)
     noise_floor = estimate_noise_floor(rms, noise_percentile)
     threshold = noise_floor * threshold_factor
-    start, end = detect_active_region(rms, noise_floor, threshold_factor, pad_samples, sig_len)
+
+    # If the input signal is already within target_length, maintain exact sample alignment (0 shift)
+    if sig_len <= out_length:
+        start = 0
+        end = sig_len
+        if sig_len < out_length:
+            active = np.pad(signal, (0, out_length - sig_len), mode="constant", constant_values=0.0)
+        else:
+            active = signal.copy()
+        w_ref = cfg.TRIAL_NOISE_REF_WINDOW if is_trial else cfg.NOISE_REF_WINDOW
+        noise_seg = extract_noise_reference(signal, min(w_ref, sig_len))
+        return {
+            "active": active.astype(np.float32),
+            "noise": noise_seg.astype(np.float32),
+            "start": start,
+            "end": end,
+            "noise_floor": float(noise_floor),
+            "threshold": float(threshold),
+        }
+
+    start, end = detect_active_region(
+        rms,
+        noise_floor,
+        threshold_factor,
+        pad_samples,
+        sig_len,
+        max_len=out_length,
+    )
 
     active_raw = signal[start:end]
     act_len = len(active_raw)

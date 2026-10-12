@@ -24,7 +24,7 @@ Raw 1-D Hydrophone Recording (.dat)
            ▼
    [Stage 2: 1-D U-Net Denoiser]
    - Fully Convolutional (Preserves arbitrary lengths: 25k, 5k, 4999)
-   - Stage 2A: Supervised Pretraining (MSE on matched synthetic pairs)
+   - Stage 2A: Supervised Pretraining (MSE on matched synthetic clean/noisy pairs)
    - [MANUAL VERIFICATION GATE]
    - Stage 2B: Unsupervised Fine-Tuning (Physical Energy Matching Loss on Real Trial Data)
            │
@@ -35,7 +35,7 @@ Raw 1-D Hydrophone Recording (.dat)
 ### Models
 1. **SignalDetectorCNN** (`detector.py`):
    - Configurable channel widths (`[16, 32, 64]`), 7-sample kernels, batch normalization, ReLU, and 4x max-pooling per stage.
-   - Global adaptive pooling to dense layer (128 units), 30% dropout, and 2-class logits.
+   - Global adaptive pooling to dense layer (128 units), 30% dropout, and 2-class logits (Signal vs Noise).
 2. **Configurable1DUNet** (`unet.py`):
    - Fully-convolutional encoder-decoder with double-convolution blocks (`Conv1d -> BN -> ReLU` x 2).
    - Linear interpolation upsampling with 1x1 projection, channel concatenation, and skip connections.
@@ -60,9 +60,10 @@ nstl_acoustic/
 ├── run_pretrain.py           # Python IDLE F5 runner for Stage 2A
 ├── run_finetune.py           # Python IDLE F5 runner for Stage 2B
 ├── run_inference.py          # Python IDLE F5 runner for inference
+├── test_pri_batch.py         # Batch runner across all trial recording channels
 ├── test_inference_headless.py# Headless verification of inference pipeline
 ├── requirements.txt          # Pinned dependencies & offline install notes
-├── README.md                 # Complete documentation
+├── README.md                 # Documentation
 ├── .gitignore                # Ignores data/, models/, inference_output/
 └── tests/
     ├── conftest.py           # Pytest sys.path setup
@@ -70,7 +71,7 @@ nstl_acoustic/
 ```
 
 ### Data Layout
-All acoustic data is stored as plain-text `.dat` files with **one float per line**. Blank lines and `#` comments are ignored; CRLF and LF are supported.
+All acoustic data is stored as plain-text `.dat` files with **one float per line**. Blank lines and `#` comments are ignored; CRLF and LF line endings are supported.
 
 - **Synthetic Data Directory** (`SYNTHETIC_DATA_DIR`):
   `C:\Users\HARSHA\.gemini\antigravity\scratch\nstl_acoustic\data`
@@ -85,15 +86,15 @@ All acoustic data is stored as plain-text `.dat` files with **one float per line
   ```
 
 - **Trial Data Directory** (`TRIAL_DATA_DIR`):
-  `C:\Users\HARSHA\Documents\pri_generated`
-  Contains 100 hydrophone recording files directly:
-  `channel0.dat`, `channel001.dat`, `channel10.dat`, ..., `channel99.dat`.
+  `C:\Users\HARSHA\Documents\pri`
+  Contains hydrophone recordings directly:
+  `channel0.dat`, `channel001.dat`, `channel2.dat`, ..., `channel10.dat`.
 
 ---
 
 ## 3. Offline / Air-Gapped Installation & Jetson Xavier Porting
 
-The project has minimal dependencies: `torch`, `numpy`, `scipy` (with `matplotlib` and `tqdm` optional and loaded lazily).
+The project requires minimal dependencies: `torch`, `numpy`, `scipy` (with `matplotlib` and `tqdm` optional and loaded lazily).
 
 ### Step 1: Build the Offline Wheel Bundle (Internet-Connected Machine)
 On a machine with internet access matching the target architecture:
@@ -113,8 +114,8 @@ No external network connections or runtime downloads are made by any script.
 
 ## 4. Execution Workflow (Strict Run Order)
 
-### Phase 1: Generate Data
-Generate synthetic 100 kHz pairs and trial 17.8 kHz bandpass recordings with realistic artefacts (clipping, CRLF, comments):
+### Phase 1: Generate Synthetic Data
+Generate synthetic 100 kHz pairs and detector samples with realistic artefacts (clipping, CRLF, comments):
 ```bash
 python generate_trial_data.py --artefacts
 ```
@@ -145,7 +146,7 @@ Inspect:
 ### Phase 5: Stage 2B Unsupervised Fine-Tuning
 Fine-tune the model directly on real hydrophone trial recordings without clean labels:
 ```bash
-python denoiser_finetune.py --stage finetune --epochs 10 --batch-size 4
+python denoiser_finetune.py --stage finetune --epochs 5 --batch-size 8 --lr 1e-5
 ```
 - Verifies `models/unet_pretrained_best.pth` exists before running (raises `FileNotFoundError` otherwise).
 - Displays a 3-second safety delay and reminder.
@@ -154,7 +155,11 @@ python denoiser_finetune.py --stage finetune --epochs 10 --batch-size 4
 
 ### Phase 6: Run Inference on Trial Data
 ```bash
-python inference.py --source trial --pri PRI_01 --channel channel001.dat --model finetuned
+# Run on a specific channel and auto-open diagnostic plot
+python inference.py --source trial --channel channel001.dat --show-plot
+
+# Or run batch inference across all channels
+python test_pri_batch.py
 ```
 Generates:
 - Denoised 1-D plain-text `.dat` file in `inference_output/channel001_denoised.dat`.
@@ -168,7 +173,7 @@ For operators running directly inside Python IDLE:
 1. Open `run_pretrain.py` in IDLE and press **F5** to pretrain.
 2. Open `run_inference.py` in IDLE and press **F5** to verify results.
 3. Open `run_finetune.py` in IDLE and press **F5** to run trial fine-tuning.
-4. Open `run_inference.py` in IDLE and press **F5** to inspect trial outputs.
+4. Open `run_inference.py` in IDLE and press **F5** to inspect trial outputs (the plot automatically pops up in the Windows Photos app).
 
 No command-line arguments are required.
 
@@ -183,7 +188,7 @@ pytest -v
 
 Verified test coverage includes:
 - `test_load_dat_file_edge_cases`: Robust handling of comments, CRLF, truncation, and padding.
-- `test_rms_envelope_vs_brute_force`: Mathematical equality between $O(N)$ cumulative sum envelope and brute force.
+- `test_rms_envelope_vs_brute_force`: Mathematical equality between $O(N)$ cumulative sum envelope and brute force moving average.
 - `test_active_region_detection_accuracy`: Known pulse location recovery within tolerance bounds.
 - `test_unet_output_shapes`: Strict shape preservation for $L \in \{5000, 25000, 4999\}$.
 - `test_unsupervised_loss_not_minimized_by_identity_or_zeros`: Proof that loss penalizes both identity and all-zeros silence.

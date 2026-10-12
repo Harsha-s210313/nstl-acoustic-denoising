@@ -264,7 +264,15 @@ def run_pipeline(
     # 6. Save Denoised Output as Plain-Text .dat
     ensure_dir(config.INFERENCE_OUTPUT_DIR)
     out_dat_path = os.path.join(config.INFERENCE_OUTPUT_DIR, f"{base_name}_denoised.dat")
-    save_dat_file(out_dat_path, denoised_signal)
+    start, end = active_bounds
+    act_len = end - start
+    if config.INFERENCE_RECONSTRUCT_FULL and len(raw_signal) > len(eval_signal) and act_len > 0:
+        out_signal = np.zeros_like(raw_signal)
+        valid_act_len = min(act_len, len(denoised_signal))
+        out_signal[start : start + valid_act_len] = denoised_signal[:valid_act_len]
+    else:
+        out_signal = denoised_signal[:len(raw_signal)]
+    save_dat_file(out_dat_path, out_signal)
     logger.info("Saved denoised output to: %s", out_dat_path)
 
     # 7. Generate Visual Diagnostic Plot (Lazy matplotlib import, Agg backend)
@@ -281,7 +289,8 @@ def run_pipeline(
 
             # Subplot 1: Time Series
             fs = config.TRIAL_SAMPLE_RATE if is_trial else config.SAMPLE_RATE
-            t = np.arange(len(eval_signal)) / fs * 1000.0  # ms
+            start_sample = active_bounds[0] if (is_trial and len(raw_signal) > len(eval_signal)) else 0
+            t = (start_sample + np.arange(len(eval_signal))) / fs * 1000.0  # ms
             ax1.plot(t, eval_signal, color="#b0bec5", alpha=0.8, label="Input Noisy")
             if clean_signal is not None:
                 ax1.plot(t, clean_signal, color="#2e7d32", alpha=0.5, linestyle="--", label="Ground Truth Clean")
@@ -334,6 +343,7 @@ def run_pipeline(
         "detector_confidence": detector_confidence,
         "snr_improvement": snr_improvement,
         "is_trial": is_trial,
+        "active_bounds": active_bounds,
     }
 
 

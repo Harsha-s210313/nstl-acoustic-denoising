@@ -271,3 +271,54 @@ def test_finetuner_never_overwrites_pretrained_checkpoint():
         # Check that original pretrained checkpoint is completely intact
         after_bytes = open(pre_ckpt, "rb").read()
         assert original_bytes == after_bytes, "Pretrained checkpoint was modified!"
+
+
+def test_correlation_zero_shift():
+    """
+    Verify that extract_active_region preserves exact time alignment (0 sample shift)
+    when correlated against a clean LFM replica.
+    If a trained checkpoint is available, verifies end-to-end U-Net zero shift as well.
+    """
+    fs = 17800.0
+    dur = 0.113
+    pulse_len = int(round(dur * fs))  # 2011 samples
+    t = np.arange(pulse_len, dtype=np.float32) / fs
+    f1, f2 = 3200.0, 5700.0
+    k = (f2 - f1) / (pulse_len / fs)
+    replica = (np.sin(2.0 * np.pi * (f1 * t + 0.5 * k * (t ** 2))) * np.hanning(pulse_len)).astype(np.float32)
+
+    cfg = Config()
+
+    # 1. 5000-sample segment with pulse at sample 750
+    np.random.seed(42)
+    sig_5k = (0.05 * np.random.randn(5000)).astype(np.float32)
+    sig_5k[750 : 750 + pulse_len] += replica
+
+    ext = extract_active_region(sig_5k, cfg, target_length=5000)
+    assert ext["start"] == 0, f"Expected start=0 for pre-segmented signal, got {ext['start']}"
+    assert ext["end"] == 5000
+
+    c_raw = np.correlate(sig_5k, replica, mode="full")
+    c_ext = np.correlate(ext["active"], replica, mode="full")
+    shift_ext = int(np.argmax(c_raw)) - int(np.argmax(c_ext))
+    assert shift_ext == 0, f"Expected 0 shift in extracted active signal, got {shift_ext}"
+
+    # 2. If trained checkpoint exists, verify end-to-end model has 0 shift
+    ckpt_path = cfg.UNET_FINETUNED_CHECKPOINT if os.path.isfile(cfg.UNET_FINETUNED_CHECKPOINT) else cfg.UNET_PRETRAINED_CHECKPOINT
+    if os.path.isfile(ckpt_path):
+        model = Configurable1DUNet(cfg=cfg)
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
+
+        norm_in, mean_val, std_val = normalize_signal(ext["active"])
+        x = to_tensor(norm_in)
+        with torch.no_grad():
+            den_norm = model(x).squeeze().numpy()
+        denoised = denormalize_signal(den_norm, mean_val, std_val)
+
+        c_den = np.correlate(denoised, replica, mode="full")
+        shift_model = int(np.argmax(c_raw)) - int(np.argmax(c_den))
+        assert shift_model == 0, f"Expected 0 shift with trained model, got {shift_model}"
+
+

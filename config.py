@@ -63,6 +63,7 @@ class Config:
     INFERENCE_DEFAULT_SOURCE: str = "trial"
     INFERENCE_TRIAL_PRI: str = ""
     INFERENCE_TRIAL_CHANNEL: str = "channel001.dat"
+    INFERENCE_RECONSTRUCT_FULL: bool = True
 
     # --------------------------------------------------------------------------
     # U-Net Architecture Configuration
