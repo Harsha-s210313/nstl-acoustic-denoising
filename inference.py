@@ -249,31 +249,70 @@ def run_pipeline(
         logger.info("Ground Truth Evaluation: Input SNR=%.2f dB, Output SNR=%.2f dB, Gain=%+.2f dB", snr_in, snr_out, snr_improvement)
     else:
         # Unsupervised estimate: compare signal-to-noise ratio before and after denoising
-        # Finds the quietest background noise segment via extract_noise_reference
-        w_ref = min(500, len(eval_signal) // 4)
-        p_noise_in = float(np.mean(extract_noise_reference(eval_signal, w_ref) ** 2)) + 1e-12
-        p_noise_out = float(np.mean(extract_noise_reference(denoised_signal, w_ref) ** 2)) + 1e-12
-        p_sig_in = float(np.mean(eval_signal ** 2))
-        p_sig_out = float(np.mean(denoised_signal ** 2))
+        # Use background noise reference from the quiet part of the recording
+        start, end = active_bounds
+        act_len = max(1, end - start)
+        sig_active_in = eval_signal[:act_len] if len(eval_signal) >= act_len else eval_signal
+        sig_active_out = denoised_signal[:act_len] if len(denoised_signal) >= act_len else denoised_signal
+
+        if noise_ref is None or len(noise_ref) == 0:
+            noise_ref = extract_noise_reference(raw_signal, min(1000, len(raw_signal) // 4))
+
+        ref_len = min(len(noise_ref), len(eval_signal))
+        noise_slice = noise_ref[:ref_len]
+        p_noise_in = float(np.mean(noise_slice ** 2)) + 1e-12
+
+        # Denoise noise slice to measure residual noise floor
+        norm_n, m_n, s_n = normalize_signal(noise_slice)
+        with torch.no_grad():
+            den_n_norm = denoiser(to_tensor(norm_n).to(dev)).squeeze().cpu().numpy()
+        den_n = denormalize_signal(den_n_norm, m_n, s_n)
+        p_noise_out = float(np.mean(den_n ** 2)) + 1e-12
+
+        p_sig_in = float(np.mean(sig_active_in ** 2))
+        p_sig_out = float(np.mean(sig_active_out ** 2))
 
         est_snr_in = float(10.0 * np.log10(max(p_sig_in - p_noise_in, 1e-8) / p_noise_in))
         est_snr_out = float(10.0 * np.log10(max(p_sig_out - p_noise_out, 1e-8) / p_noise_out))
         snr_improvement = est_snr_out - est_snr_in
-        logger.info("Estimated SNR Gain: %+.2f dB", snr_improvement)
+        logger.info("Estimated SNR Gain: %+.2f dB (In: %.2f dB, Out: %.2f dB)", snr_improvement, est_snr_in, est_snr_out)
 
-    # 6. Save Denoised Output as Plain-Text .dat
+    # 6. Save Denoised Output as Plain-Text .dat and metadata JSON sidecar
     ensure_dir(config.INFERENCE_OUTPUT_DIR)
     out_dat_path = os.path.join(config.INFERENCE_OUTPUT_DIR, f"{base_name}_denoised.dat")
+    out_meta_path = os.path.join(config.INFERENCE_OUTPUT_DIR, f"{base_name}_meta.json")
     start, end = active_bounds
     act_len = end - start
     if config.INFERENCE_RECONSTRUCT_FULL and len(raw_signal) > len(eval_signal) and act_len > 0:
         out_signal = np.zeros_like(raw_signal)
         valid_act_len = min(act_len, len(denoised_signal))
         out_signal[start : start + valid_act_len] = denoised_signal[:valid_act_len]
+        reconstructed_full = True
     else:
         out_signal = denoised_signal[:len(raw_signal)]
+        reconstructed_full = False
     save_dat_file(out_dat_path, out_signal)
     logger.info("Saved denoised output to: %s", out_dat_path)
+
+    import json
+    meta_info = {
+        "base_name": base_name,
+        "input_path": input_path,
+        "output_dat": out_dat_path,
+        "is_trial": is_trial,
+        "crop_start": int(start),
+        "crop_end": int(end),
+        "crop_length": int(act_len),
+        "raw_length": int(len(raw_signal)),
+        "eval_length": int(len(eval_signal)),
+        "reconstructed_full": reconstructed_full,
+        "detector_verdict": detector_verdict,
+        "detector_confidence": detector_confidence,
+        "snr_improvement_db": float(snr_improvement),
+    }
+    with open(out_meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta_info, f, indent=2)
+    logger.info("Saved metadata sidecar to: %s", out_meta_path)
 
     # 7. Generate Visual Diagnostic Plot (Lazy matplotlib import, Agg backend)
     plot_path = None
@@ -339,6 +378,7 @@ def run_pipeline(
         "input_path": input_path,
         "output_dat": out_dat_path,
         "output_plot": plot_path,
+        "output_meta": out_meta_path,
         "detector_verdict": detector_verdict,
         "detector_confidence": detector_confidence,
         "snr_improvement": snr_improvement,
