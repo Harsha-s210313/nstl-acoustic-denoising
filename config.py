@@ -137,6 +137,8 @@ class Config:
     FINETUNE_LR_PATIENCE: int = 5
     FINETUNE_LR_MIN: float = 1e-7
     FINETUNE_NOISE_LAMBDA: float = 0.7
+    FINETUNE_SMOOTH_SCALE: float = 0.05
+    FINETUNE_PHASE_WEIGHT: float = 0.05
 
     def validate(self) -> None:
         """
@@ -187,6 +189,10 @@ class Config:
             raise ValueError(f"PRETRAIN_VAL_SPLIT must be in [0, 1), got {self.PRETRAIN_VAL_SPLIT}")
         if not (0.0 <= self.FINETUNE_NOISE_LAMBDA <= 1.0):
             raise ValueError(f"FINETUNE_NOISE_LAMBDA must be in [0, 1], got {self.FINETUNE_NOISE_LAMBDA}")
+        if not (0.0 <= self.FINETUNE_SMOOTH_SCALE <= 1.0):
+            raise ValueError(f"FINETUNE_SMOOTH_SCALE must be in [0, 1], got {self.FINETUNE_SMOOTH_SCALE}")
+        if not (0.0 <= self.FINETUNE_PHASE_WEIGHT <= 1.0):
+            raise ValueError(f"FINETUNE_PHASE_WEIGHT must be in [0, 1], got {self.FINETUNE_PHASE_WEIGHT}")
 
 
 # Default singleton instance

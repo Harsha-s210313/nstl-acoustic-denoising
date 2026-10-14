@@ -40,18 +40,27 @@ class UnsupervisedNoiseSuppressionLoss(nn.Module):
       signal_power = mean(denoised^2)
       target_power = clamp(noisy_power - noise_power, min=1e-8)
       loss_energy = mean((signal_power - target_power)^2)
-      loss_smooth = mean((denoised[t+1] - denoised[t])^2)
+      loss_smooth = mean((denoised[t+1] - denoised[t])^2) * smooth_scale
+      loss_phase  = 1.0 - cosine_similarity(denoised, noisy)
       loss_over   = mean(clamp(noise_power - signal_power, min=0))
-      total = lam * loss_energy + (1 - lam) * loss_smooth + 0.1 * loss_over
+      total = lam * loss_energy + (1 - lam) * loss_smooth + phase_weight * loss_phase + 0.1 * loss_over
 
     Guaranteed properties:
     - NOT minimized by identity (denoised == noisy produces non-zero loss when noise_ref is present).
     - NOT minimized by all-zeros silence (signal_power == 0 incurs penalty from both target_power and loss_over).
+    - Preserves high-frequency chirp carrier phase and waveform coherence, preventing correlation peak attenuation.
     """
 
-    def __init__(self, lam: float = 0.7) -> None:
+    def __init__(
+        self,
+        lam: float = 0.7,
+        smooth_scale: float = 0.05,
+        phase_weight: float = 0.05,
+    ) -> None:
         super().__init__()
         self.lam = float(lam)
+        self.smooth_scale = float(smooth_scale)
+        self.phase_weight = float(phase_weight)
 
     def forward(
         self,
@@ -67,9 +76,15 @@ class UnsupervisedNoiseSuppressionLoss(nn.Module):
         target_power = torch.clamp(noisy_power - noise_power, min=1e-8)
         loss_energy = torch.mean((signal_power - target_power) ** 2)
 
-        # Smoothness penalty against high-frequency residual jitter
+        # Smoothness penalty scaled to prevent suppressing high-frequency acoustic chirps
         diff = denoised[..., 1:] - denoised[..., :-1]
-        loss_smooth = torch.mean(diff ** 2)
+        loss_smooth = torch.mean(diff ** 2) * self.smooth_scale
+
+        # Carrier phase and waveform coherence with input signal:
+        # Prevents phase drift and distortion of the LFM chirp trajectory
+        dot = torch.sum(denoised * noisy, dim=-1, keepdim=True)
+        norm_prod = torch.sqrt(torch.sum(denoised**2, dim=-1, keepdim=True) * torch.sum(noisy**2, dim=-1, keepdim=True) + 1e-8)
+        loss_phase = torch.mean(1.0 - (dot / norm_prod))
 
         # Penalty against over-suppression below background noise floor
         loss_over = torch.mean(torch.clamp(noise_power - signal_power, min=0.0))
@@ -77,6 +92,7 @@ class UnsupervisedNoiseSuppressionLoss(nn.Module):
         total_loss = (
             self.lam * loss_energy
             + (1.0 - self.lam) * loss_smooth
+            + self.phase_weight * loss_phase
             + 0.1 * loss_over
         )
         return total_loss
@@ -310,7 +326,11 @@ class TrialDataFineTuner:
             lr=learning_rate,
             weight_decay=self.cfg.FINETUNE_WEIGHT_DECAY,
         )
-        criterion = UnsupervisedNoiseSuppressionLoss(lam=self.cfg.FINETUNE_NOISE_LAMBDA)
+        criterion = UnsupervisedNoiseSuppressionLoss(
+            lam=self.cfg.FINETUNE_NOISE_LAMBDA,
+            smooth_scale=getattr(self.cfg, "FINETUNE_SMOOTH_SCALE", 0.05),
+            phase_weight=getattr(self.cfg, "FINETUNE_PHASE_WEIGHT", 0.05),
+        )
         scheduler = ReduceLROnPlateau(
             optimizer,
             mode="min",
