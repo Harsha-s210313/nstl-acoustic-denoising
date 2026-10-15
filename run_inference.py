@@ -28,7 +28,7 @@ def run() -> None:
 
     # Pretrained checkpoint provides robust supervised noise suppression
     # Finetuned checkpoint applies unsupervised noise reference adaptation
-    model_choice = "pretrained"
+    model_choice = "finetuned"
     if not os.path.isfile(cfg.UNET_PRETRAINED_CHECKPOINT) and os.path.isfile(cfg.UNET_FINETUNED_CHECKPOINT):
         model_choice = "finetuned"
 

@@ -277,10 +277,29 @@ def extract_active_region(
         max_len=out_length,
     )
 
-    active_raw = signal[start:end]
+    # Low-SNR Fallback: if RMS envelope failed to exceed threshold (fell back to entire signal)
+    # and recording length exceeds target_length, locate pulse via matched-filter replica correlation
+    if (start == 0 and end == sig_len) and sig_len > out_length:
+        fs_sig = cfg.TRIAL_SAMPLE_RATE if is_trial else cfg.SAMPLE_RATE
+        f_s = 3200.0 if is_trial else 21000.0
+        f_e = 5700.0 if is_trial else 23500.0
+        dur = 0.113 if is_trial else 0.025
+        p_onset = find_pulse_via_matched_filter(signal, fs=fs_sig, duration=dur, f_start=f_s, f_end=f_e)
+        logger.info("Low-SNR detected: matched-filter replica localized pulse onset at sample %d", p_onset)
+        start = max(0, p_onset - pad_samples)
+        end = min(sig_len, start + out_length)
+        if (end - start) < out_length and start > 0:
+            start = max(0, end - out_length)
+
+    active_raw = signal[start:end].copy()
     act_len = len(active_raw)
 
     if act_len < out_length:
+        # Smooth cosine taper on the tail to avoid sharp step-edge Gibbs ringing
+        taper_len = min(50, act_len // 4)
+        if taper_len > 0:
+            taper = 0.5 * (1.0 + np.cos(np.linspace(0, np.pi, taper_len, dtype=np.float32)))
+            active_raw[-taper_len:] *= taper
         active = np.pad(active_raw, (0, out_length - act_len), mode="constant", constant_values=0.0)
     elif act_len > out_length:
         active = active_raw[:out_length]
@@ -324,6 +343,57 @@ def extract_noise_reference(signal: np.ndarray, window_len: int) -> np.ndarray:
     win_energy = cumsum[window_len:] - cumsum[:-window_len]
     min_idx = int(np.argmin(win_energy))
     return signal[min_idx: min_idx + window_len].astype(np.float32)
+
+
+def find_pulse_via_matched_filter(
+    signal: np.ndarray,
+    fs: float,
+    duration: float = 0.113,
+    f_start: float = 3200.0,
+    f_end: float = 5700.0,
+) -> int:
+    """
+    Locate pulse onset via matched filtering against known LFM replica.
+    Provides ~+24.5 dB processing gain, allowing pulse detection down to -15 dB SNR.
+    """
+    p_len = int(duration * fs)
+    if len(signal) < p_len:
+        return 0
+    t = np.arange(p_len, dtype=np.float32) / fs
+    k = (f_end - f_start) / duration
+    replica = (np.sin(2 * np.pi * (f_start * t + 0.5 * k * t**2)) * np.hanning(p_len)).astype(np.float32)
+    rep_norm = replica / (np.sqrt(np.sum(replica ** 2)) + 1e-12)
+    corr = np.correlate(signal, rep_norm, mode="full")
+    peak_idx = int(np.argmax(corr)) - (len(replica) - 1)
+    return max(0, min(peak_idx, len(signal) - p_len))
+
+
+def apply_bandpass_filter(
+    signal: np.ndarray,
+    fs: float,
+    lowcut: float,
+    highcut: float,
+    order: int = 4,
+) -> np.ndarray:
+    """
+    Zero-phase Butterworth bandpass filter.
+    Processes forward and reverse (filtfilt) to ensure zero phase distortion and zero delay.
+    Removes out-of-band piecewise ReLU convolution hash and sensor DC drift.
+    """
+    try:
+        from scipy.signal import butter, filtfilt
+        arr = np.asarray(signal, dtype=np.float32)
+        nyq = 0.5 * fs
+        low = max(0.001, lowcut / nyq)
+        high = min(0.999, highcut / nyq)
+        if low >= high or len(arr) < 3 * (order * 2 + 1):
+            return arr
+        b, a = butter(order, [low, high], btype="bandpass")
+        filtered = filtfilt(b, a, arr)
+        return filtered.astype(np.float32)
+    except Exception as e:
+        logger.debug("Bandpass filtering fallback (skipped): %s", e)
+        return np.asarray(signal, dtype=np.float32)
 
 
 def normalize_signal(signal: np.ndarray, eps: float = 1e-8) -> Tuple[np.ndarray, float, float]:

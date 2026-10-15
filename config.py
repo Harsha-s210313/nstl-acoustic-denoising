@@ -64,6 +64,7 @@ class Config:
     INFERENCE_TRIAL_PRI: str = ""
     INFERENCE_TRIAL_CHANNEL: str = "channel001.dat"
     INFERENCE_RECONSTRUCT_FULL: bool = True
+    INFERENCE_CLEANUP_BPF: bool = True
 
     # --------------------------------------------------------------------------
     # U-Net Architecture Configuration

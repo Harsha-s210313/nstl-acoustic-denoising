@@ -23,6 +23,7 @@ try:
         denormalize_signal,
         extract_active_region,
         extract_noise_reference,
+        apply_bandpass_filter,
         ensure_dir,
         to_tensor,
     )
@@ -37,6 +38,7 @@ except (ImportError, ValueError):
         denormalize_signal,
         extract_active_region,
         extract_noise_reference,
+        apply_bandpass_filter,
         ensure_dir,
         to_tensor,
     )
@@ -239,6 +241,14 @@ def run_pipeline(
 
     denoised_norm = output_tensor.squeeze().cpu().numpy()
     denoised_signal = denormalize_signal(denoised_norm, mean_val, std_val)
+
+    # Apply zero-phase bandpass cleanup to eliminate out-of-band piecewise ReLU convolution hash
+    if getattr(config, "INFERENCE_CLEANUP_BPF", True):
+        fs_sig = config.TRIAL_SAMPLE_RATE if is_trial else config.SAMPLE_RATE
+        if is_trial:
+            denoised_signal = apply_bandpass_filter(denoised_signal, fs=fs_sig, lowcut=2500.0, highcut=6500.0)
+        else:
+            denoised_signal = apply_bandpass_filter(denoised_signal, fs=fs_sig, lowcut=15000.0, highcut=30000.0)
 
     # 5. Compute SNR Metrics
     snr_improvement = 0.0
