@@ -45,7 +45,6 @@ def run() -> None:
     print(f"  Model Stage:      {model_choice}")
     print(f"  Denoised Output:  {res['output_dat']}")
     print(f"  Diagnostic Plot:  {res['output_plot']}")
-    print(f"  Detector:         {res['detector_verdict']}")
     print(f"  SNR Improvement:  {res['snr_improvement']:+.2f} dB")
 
     # Ensure plot opens on Windows

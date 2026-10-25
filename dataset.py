@@ -1,8 +1,7 @@
 """
 PyTorch Dataset implementations for:
-1. DetectorDataset: Supervised pulse detection (Signal=1, Noise=0).
-2. UNetPretrainDataset: Supervised pretraining on matched synthetic clean/noisy pairs.
-3. NoiseAdaptationUNetDataset: Unsupervised noise adaptation on trial data.
+1. UNetPretrainDataset: Supervised pretraining on matched synthetic clean/noisy pairs.
+2. NoiseAdaptationUNetDataset: Unsupervised noise adaptation on trial data.
 """
 
 import os
@@ -37,88 +36,6 @@ except (ImportError, ValueError):
     )
 
 logger = logging.getLogger(__name__)
-
-
-class DetectorDataset(Dataset):
-    """
-    Dataset for Stage 1 CNN Detector.
-    Loads signals from DETECTOR_DATA_DIR/signal (label 1) and DETECTOR_DATA_DIR/noise (label 0).
-    Applies independent z-score normalization and optional training jitter.
-    """
-
-    def __init__(
-        self,
-        cfg: Config,
-        split: str = "train",
-        augment: bool = True,
-    ) -> None:
-        super().__init__()
-        self.cfg = cfg
-        self.split = split
-        self.augment = augment and (split == "train") and cfg.AUG_ENABLED
-
-        sig_dir = os.path.join(cfg.DETECTOR_DATA_DIR, "signal")
-        if not os.path.isdir(sig_dir):
-            for alt in [
-                os.path.join(cfg.SYNTHETIC_DATA_DIR, "detector", "signal"),
-                os.path.join(cfg.SYNTHETIC_DATA_DIR, "signal"),
-            ]:
-                if os.path.isdir(alt):
-                    sig_dir = alt
-                    break
-
-        noise_dir = os.path.join(cfg.DETECTOR_DATA_DIR, "noise")
-        if not os.path.isdir(noise_dir):
-            for alt in [
-                os.path.join(cfg.SYNTHETIC_DATA_DIR, "detector", "noise"),
-                os.path.join(cfg.SYNTHETIC_DATA_DIR, "noise"),
-            ]:
-                if os.path.isdir(alt):
-                    noise_dir = alt
-                    break
-
-        samples: List[Tuple[str, int]] = []
-        if os.path.isdir(sig_dir):
-            for f in sorted(glob.glob(os.path.join(sig_dir, "*.dat"))):
-                samples.append((f, 1))
-        if os.path.isdir(noise_dir):
-            for f in sorted(glob.glob(os.path.join(noise_dir, "*.dat"))):
-                samples.append((f, 0))
-
-        if not samples:
-            logger.warning("No detector data found in %s", cfg.DETECTOR_DATA_DIR)
-
-        # Deterministic shuffle & split
-        rng = np.random.RandomState(cfg.RANDOM_SEED)
-        indices = np.arange(len(samples))
-        rng.shuffle(indices)
-
-        val_size = int(len(samples) * cfg.DETECTOR_VAL_SPLIT)
-        if split == "train":
-            chosen_indices = indices[val_size:]
-        else:
-            chosen_indices = indices[:val_size]
-
-        self.samples = [samples[i] for i in chosen_indices]
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        path, label = self.samples[idx]
-        data = load_dat_file(path, expected_length=self.cfg.SIGNAL_LENGTH)
-        norm_data, _, _ = normalize_signal(data)
-
-        if self.augment and self.cfg.AUG_AMPLITUDE_JITTER > 0:
-            jitter = np.random.uniform(
-                1.0 - self.cfg.AUG_AMPLITUDE_JITTER,
-                1.0 + self.cfg.AUG_AMPLITUDE_JITTER,
-            )
-            norm_data = norm_data * jitter
-
-        x = to_tensor(norm_data, dtype=torch.float32)
-        y = torch.tensor(label, dtype=torch.long)
-        return x, y
 
 
 class UNetPretrainDataset(Dataset):

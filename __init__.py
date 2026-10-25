@@ -1,5 +1,5 @@
 """
-NSTL Underwater Acoustic Signal Detection & Denoising Package.
+NSTL Underwater Acoustic Signal Denoising Package.
 """
 
 from .config import Config, default_config
@@ -17,7 +17,6 @@ from .utils import (
     to_tensor,
     ensure_dir,
 )
-from .detector import SignalDetectorCNN
 from .unet import Configurable1DUNet
 from .denoiser_finetune import (
     UnsupervisedNoiseSuppressionLoss,
@@ -40,7 +39,6 @@ __all__ = [
     "denormalize_signal",
     "to_tensor",
     "ensure_dir",
-    "SignalDetectorCNN",
     "Configurable1DUNet",
     "UnsupervisedNoiseSuppressionLoss",
     "SyntheticDenoiserTrainer",

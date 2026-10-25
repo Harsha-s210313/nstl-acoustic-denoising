@@ -24,7 +24,6 @@ try:
         to_tensor,
     )
     from nstl_acoustic.unet import Configurable1DUNet
-    from nstl_acoustic.detector import SignalDetectorCNN
     from nstl_acoustic.denoiser_finetune import (
         UnsupervisedNoiseSuppressionLoss,
         TrialDataFineTuner,
@@ -42,7 +41,6 @@ except ModuleNotFoundError:
         to_tensor,
     )
     from unet import Configurable1DUNet
-    from detector import SignalDetectorCNN
     from denoiser_finetune import (
         UnsupervisedNoiseSuppressionLoss,
         TrialDataFineTuner,

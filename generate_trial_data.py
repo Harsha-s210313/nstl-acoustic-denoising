@@ -278,14 +278,13 @@ def generate_physics_based_synthetic_pair(
 def generate_all_data(
     cfg: Optional[Config] = None,
     num_synthetic: int = 32,
-    num_detector_noise: int = 32,
     num_trial_pri: int = 3,
     channels_per_pri: int = 4,
     artefacts: bool = False,
     plot_sample: bool = False,
 ) -> None:
     """
-    Generate synthetic dataset, detector dataset, and realistic trial dataset.
+    Generate synthetic clean/noisy dataset and realistic trial dataset.
     All data is generated with physically realistic ocean acoustic properties.
     """
     config = cfg or default_config
@@ -295,13 +294,9 @@ def generate_all_data(
     logger.info("Generating Physics-Based Synthetic Clean and Noisy Pairs (%d pairs)...", num_synthetic)
     clean_dir = os.path.join(config.SYNTHETIC_DATA_DIR, config.SYNTHETIC_CLEAN_SUBDIR)
     noisy_dir = os.path.join(config.SYNTHETIC_DATA_DIR, config.SYNTHETIC_NOISY_SUBDIR)
-    det_sig_dir = os.path.join(config.DETECTOR_DATA_DIR, "signal")
-    det_noise_dir = os.path.join(config.DETECTOR_DATA_DIR, "noise")
 
     ensure_dir(clean_dir)
     ensure_dir(noisy_dir)
-    ensure_dir(det_sig_dir)
-    ensure_dir(det_noise_dir)
 
     # 1. Synthetic clean/noisy pairs for pretraining
     fs = config.SAMPLE_RATE
@@ -321,25 +316,6 @@ def generate_all_data(
 
         write_dat_with_optional_artefacts(os.path.join(clean_dir, filename), clean_sig, inject_artefacts=False)
         write_dat_with_optional_artefacts(os.path.join(noisy_dir, filename), noisy_sig, inject_artefacts=artefacts, rng=rng)
-
-        # Populate detector signal dataset
-        write_dat_with_optional_artefacts(os.path.join(det_sig_dir, filename), noisy_sig, inject_artefacts=artefacts, rng=rng)
-
-    # 2. Pure ambient ocean noise files for detector (negative class)
-    logger.info("Generating Pure Ocean Noise Recordings (%d files)...", num_detector_noise)
-    nyq = 0.5 * fs
-    b, a = butter(2, [10000.0 / nyq, 40000.0 / nyq], btype="bandpass")
-    for i in range(1, num_detector_noise + 1):
-        filename = f"det_noise_{i:04d}.dat"
-        white = rng.normal(0.0, float(rng.uniform(15.0, 35.0)), size=total_len).astype(np.float32)
-        ocean_noise = lfilter(b, a, white).astype(np.float32)
-
-        # Add occasional biological click
-        if rng.random() < 0.3:
-            s_idx = rng.randint(100, total_len - 100)
-            ocean_noise[s_idx] = float(rng.uniform(100.0, 250.0) * rng.choice([-1.0, 1.0]))
-
-        write_dat_with_optional_artefacts(os.path.join(det_noise_dir, filename), ocean_noise, inject_artefacts=artefacts, rng=rng)
 
     # 3. Realistic trial recordings matching Image 1 & sea trial dataset
     logger.info("Generating Trial Datasets (17.8 kHz bandpass-sampled recordings, 19,299 samples)...")
@@ -411,7 +387,6 @@ def generate_all_data(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate Synthetic & Trial Hydrophone Datasets")
     parser.add_argument("--num-synthetic", type=int, default=32, help="Number of synthetic clean/noisy pairs")
-    parser.add_argument("--num-detector-noise", type=int, default=32, help="Number of pure noise files for detector")
     parser.add_argument("--num-trial-pri", type=int, default=3, help="Number of trial PRIs")
     parser.add_argument("--channels-per-pri", type=int, default=4, help="Channels per trial PRI")
     parser.add_argument("--artefacts", action="store_true", help="Inject realistic artefacts (clipping, comments, CRLF)")
@@ -420,7 +395,6 @@ if __name__ == "__main__":
 
     generate_all_data(
         num_synthetic=args.num_synthetic,
-        num_detector_noise=args.num_detector_noise,
         num_trial_pri=args.num_trial_pri,
         channels_per_pri=args.channels_per_pri,
         artefacts=args.artefacts,

@@ -1,5 +1,5 @@
 """
-Configuration module for the two-stage underwater acoustic detection and denoising pipeline.
+Configuration module for underwater acoustic denoising pipeline.
 Single source of truth for all parameters, hyperparameters, and relative file paths.
 """
 
@@ -53,9 +53,7 @@ class Config:
     TRIAL_SIGNAL_SUBDIR: str = ""
     TRIAL_NOISE_SUBDIR: str = ""  # Optional, may not exist
 
-    DETECTOR_DATA_DIR: str = r"C:\Users\HARSHA\.gemini\antigravity\scratch\nstl_acoustic\data\detector"
     MODELS_DIR: str = "models"
-    DETECTOR_CHECKPOINT: str = "models/detector_best.pth"
     UNET_PRETRAINED_CHECKPOINT: str = "models/unet_pretrained_best.pth"
     UNET_FINETUNED_CHECKPOINT: str = "models/unet_finetuned_best.pth"
 
@@ -76,20 +74,6 @@ class Config:
         "in_channels": 1,
         "out_channels": 1,
     })
-
-    # --------------------------------------------------------------------------
-    # Stage 1: Detector Hyperparameters
-    # --------------------------------------------------------------------------
-    DETECTOR_FEATURES: List[int] = field(default_factory=lambda: [16, 32, 64])
-    DETECTOR_KERNEL_SIZE: int = 7
-    DETECTOR_DROPOUT: float = 0.3
-    DETECTOR_FC_HIDDEN: int = 128
-    DETECTOR_EPOCHS: int = 50
-    DETECTOR_BATCH_SIZE: int = 16
-    DETECTOR_LR: float = 1e-3
-    DETECTOR_WEIGHT_DECAY: float = 1e-4
-    DETECTOR_VAL_SPLIT: float = 0.2
-    DETECTOR_PATIENCE: int = 15
 
     # --------------------------------------------------------------------------
     # Stage 2A: Pretraining Hyperparameters (Supervised Synthetic Clean/Noisy)
@@ -177,15 +161,7 @@ class Config:
         if not isinstance(k, int) or k <= 0 or k % 2 == 0:
             raise ValueError(f"UNET_CONFIG['kernel_size'] must be a positive odd integer, got {k}")
 
-        # Detector validation
-        if not self.DETECTOR_FEATURES or not all(isinstance(f, int) and f > 0 for f in self.DETECTOR_FEATURES):
-            raise ValueError("DETECTOR_FEATURES must be a non-empty list of positive integers")
-        if self.DETECTOR_KERNEL_SIZE <= 0 or self.DETECTOR_KERNEL_SIZE % 2 == 0:
-            raise ValueError(f"DETECTOR_KERNEL_SIZE must be positive odd integer, got {self.DETECTOR_KERNEL_SIZE}")
-
         # Splits and Lambda validation
-        if not (0.0 <= self.DETECTOR_VAL_SPLIT < 1.0):
-            raise ValueError(f"DETECTOR_VAL_SPLIT must be in [0, 1), got {self.DETECTOR_VAL_SPLIT}")
         if not (0.0 <= self.PRETRAIN_VAL_SPLIT < 1.0):
             raise ValueError(f"PRETRAIN_VAL_SPLIT must be in [0, 1), got {self.PRETRAIN_VAL_SPLIT}")
         if not (0.0 <= self.FINETUNE_NOISE_LAMBDA <= 1.0):

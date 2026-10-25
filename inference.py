@@ -1,7 +1,7 @@
 """
-Inference engine for underwater acoustic signal detection and denoising.
+Inference engine for underwater acoustic signal denoising.
 Processes synthetic or trial recordings, performs active-region extraction,
-applies Stage 1 Detector and Stage 2 U-Net Denoiser, computes SNR metrics,
+applies Stage 2 U-Net Denoiser, computes SNR metrics,
 and exports text .dat files and headless visual diagnostic plots.
 """
 
@@ -27,7 +27,6 @@ try:
         ensure_dir,
         to_tensor,
     )
-    from .detector import SignalDetectorCNN
     from .unet import Configurable1DUNet
 except (ImportError, ValueError):
     from config import Config, default_config
@@ -42,7 +41,6 @@ except (ImportError, ValueError):
         ensure_dir,
         to_tensor,
     )
-    from detector import SignalDetectorCNN
     from unet import Configurable1DUNet
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -68,7 +66,6 @@ def run_pipeline(
     channel: Optional[str] = None,
     model_type: Optional[str] = None,
     checkpoint: Optional[str] = None,
-    detector_checkpoint: Optional[str] = None,
     device: Optional[str] = None,
     cfg: Optional[Config] = None,
     save_plot: bool = True,
@@ -179,32 +176,7 @@ def run_pipeline(
         noise_ref = None
         active_bounds = (0, len(eval_signal))
 
-    # 3. Stage 1: Detector Evaluation
-    det_ckpt_path = detector_checkpoint or config.DETECTOR_CHECKPOINT
-    detector_verdict = "Detector checkpoint not loaded"
-    detector_confidence = 0.0
-
-    if os.path.isfile(det_ckpt_path):
-        try:
-            det_model = SignalDetectorCNN(cfg=config).to(dev)
-            det_ckpt = torch.load(det_ckpt_path, map_location=dev)
-            det_model.load_state_dict(det_ckpt["model_state_dict"])
-            det_model.eval()
-
-            # Normalize for detector input
-            det_norm, _, _ = normalize_signal(eval_signal)
-            det_tensor = to_tensor(det_norm).to(dev)
-            preds, probs = det_model.predict(det_tensor)
-            pred_class = int(preds[0].item())
-            prob_signal = float(probs[0, 1].item())
-            detector_confidence = prob_signal
-            verdict_text = "Pulse Present" if pred_class == 1 else "Noise Only"
-            detector_verdict = f"{verdict_text} (Conf: {prob_signal * 100.0:.1f}%)"
-            logger.info("Detector Stage: %s", detector_verdict)
-        except Exception as e:
-            logger.warning("Failed evaluating detector: %s", e)
-    else:
-        logger.info("Detector checkpoint not found at %s. Skipping Stage 1.", det_ckpt_path)
+    # 3. Denoiser Evaluation
 
     if checkpoint:
         unet_ckpt_path = checkpoint
@@ -316,8 +288,6 @@ def run_pipeline(
         "raw_length": int(len(raw_signal)),
         "eval_length": int(len(eval_signal)),
         "reconstructed_full": reconstructed_full,
-        "detector_verdict": detector_verdict,
-        "detector_confidence": detector_confidence,
         "snr_improvement_db": float(snr_improvement),
     }
     with open(out_meta_path, "w", encoding="utf-8") as f:
@@ -344,7 +314,7 @@ def run_pipeline(
             if clean_signal is not None:
                 ax1.plot(t, clean_signal, color="#2e7d32", alpha=0.5, linestyle="--", label="Ground Truth Clean")
             ax1.plot(t, denoised_signal, color="#1565c0", linewidth=1.2, label=f"Denoised ({model_type})")
-            ax1.set_title(f"Acoustic Time Series [{base_name}] | Detector: {detector_verdict}", fontsize=11, fontweight="bold")
+            ax1.set_title(f"Acoustic Time Series [{base_name}]", fontsize=11, fontweight="bold")
             ax1.set_xlabel("Time (ms)")
             ax1.set_ylabel("Amplitude")
             ax1.grid(True, linestyle=":", alpha=0.6)
@@ -389,8 +359,6 @@ def run_pipeline(
         "output_dat": out_dat_path,
         "output_plot": plot_path,
         "output_meta": out_meta_path,
-        "detector_verdict": detector_verdict,
-        "detector_confidence": detector_confidence,
         "snr_improvement": snr_improvement,
         "is_trial": is_trial,
         "active_bounds": active_bounds,
@@ -398,13 +366,12 @@ def run_pipeline(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Acoustic Pipeline Detection and Denoising Inference")
+    parser = argparse.ArgumentParser(description="Acoustic Pipeline Denoising Inference")
     parser.add_argument("--source", type=str, default="synthetic", help="Source: 'synthetic', 'trial', or direct file path")
     parser.add_argument("--pri", type=str, default=None, help="Trial PRI folder (e.g. 'PRI_01')")
     parser.add_argument("--channel", type=str, default=None, help="Trial channel file (e.g. 'channel001.dat')")
     parser.add_argument("--model", type=str, choices=["pretrained", "finetuned"], default=None, help="U-Net checkpoint stage")
     parser.add_argument("--checkpoint", type=str, default=None, help="Explicit denoiser checkpoint path")
-    parser.add_argument("--detector-checkpoint", type=str, default=None, help="Explicit detector checkpoint path")
     parser.add_argument("--device", type=str, default=None, help="Device (cpu/cuda)")
     parser.add_argument("--show-plot", action="store_true", help="Open generated diagnostic plot in viewer")
     args = parser.parse_args()
@@ -415,7 +382,6 @@ def main():
         channel=args.channel,
         model_type=args.model,
         checkpoint=args.checkpoint,
-        detector_checkpoint=args.detector_checkpoint,
         device=args.device,
         show_plot=args.show_plot,
     )

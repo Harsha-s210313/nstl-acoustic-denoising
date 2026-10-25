@@ -1,5 +1,5 @@
 """
-Headless End-to-End Test for Detection & Denoising Inference Pipeline.
+Headless End-to-End Test for Denoising Inference Pipeline.
 Runs completely headless without requiring an interactive display or GUI window.
 """
 
@@ -12,13 +12,11 @@ import torch
 try:
     from .config import Config
     from .utils import load_dat_file, save_dat_file, ensure_dir
-    from .detector import SignalDetectorCNN
     from .unet import Configurable1DUNet
     from .inference import run_pipeline
 except (ImportError, ValueError):
     from config import Config
     from utils import load_dat_file, save_dat_file, ensure_dir
-    from detector import SignalDetectorCNN
     from unet import Configurable1DUNet
     from inference import run_pipeline
 
@@ -31,9 +29,7 @@ def test_headless_inference_end_to_end():
         cfg = Config(
             SYNTHETIC_DATA_DIR=os.path.join(tmp_dir, "synthetic"),
             TRIAL_DATA_DIR=os.path.join(tmp_dir, "trial"),
-            DETECTOR_DATA_DIR=os.path.join(tmp_dir, "detector"),
             MODELS_DIR=os.path.join(tmp_dir, "models"),
-            DETECTOR_CHECKPOINT=os.path.join(tmp_dir, "models", "detector_best.pth"),
             UNET_PRETRAINED_CHECKPOINT=os.path.join(tmp_dir, "models", "unet_pretrained_best.pth"),
             UNET_FINETUNED_CHECKPOINT=os.path.join(tmp_dir, "models", "unet_finetuned_best.pth"),
             INFERENCE_OUTPUT_DIR=os.path.join(tmp_dir, "inference_output"),
@@ -53,14 +49,7 @@ def test_headless_inference_end_to_end():
         save_dat_file(os.path.join(synth_clean_dir, "synth_test.dat"), clean_sig)
         save_dat_file(os.path.join(synth_noisy_dir, "synth_test.dat"), noisy_sig)
 
-        # 2. Create dummy checkpoints
-        det = SignalDetectorCNN(cfg=cfg)
-        torch.save({
-            "tag": "detector",
-            "model_state_dict": det.state_dict(),
-            "config": {"features": cfg.DETECTOR_FEATURES},
-        }, cfg.DETECTOR_CHECKPOINT)
-
+        # 2. Create dummy checkpoint
         unet = Configurable1DUNet(cfg=cfg)
         torch.save({
             "tag": "pretrained",
@@ -82,7 +71,6 @@ def test_headless_inference_end_to_end():
         assert os.path.isfile(res_synth["output_plot"]), f"Missing plot: {res_synth['output_plot']}"
         denoised_data = load_dat_file(res_synth["output_dat"])
         assert len(denoised_data) == cfg.SIGNAL_LENGTH, f"Length mismatch: {len(denoised_data)} vs {cfg.SIGNAL_LENGTH}"
-        assert "Pulse Present" in res_synth["detector_verdict"] or "Noise Only" in res_synth["detector_verdict"]
         assert os.path.getsize(res_synth["output_plot"]) > 1000
 
         # 4. Test Trial Headless Inference
