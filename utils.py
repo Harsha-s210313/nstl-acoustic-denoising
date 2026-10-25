@@ -105,18 +105,19 @@ def load_dat_file(
     return arr
 
 
-def save_dat_file(path: str, signal: Union[np.ndarray, torch.Tensor]) -> None:
+def save_dat_file(path: str, signal: Union[np.ndarray, torch.Tensor], decimal_places: int = 6) -> None:
     """
-    Save 1D signal to a plain-text .dat file (one float per line).
+    Save 1D signal to a plain-text .dat file formatted with Windows CRLF (\\r\\n), one float per line (%.6f).
     """
     ensure_dir(path)
     if isinstance(signal, torch.Tensor):
         signal = signal.detach().cpu().squeeze().numpy()
-    signal = np.asarray(signal, dtype=np.float32).ravel()
+    signal = np.asarray(signal, dtype=np.float64).ravel()
+    fmt = f"%.{decimal_places}f\r\n"
 
-    with open(path, "w", encoding="utf-8") as f:
-        for val in signal:
-            f.write(f"{val:.8e}\n")
+    with open(path, "wb") as f:
+        content = "".join(fmt % val for val in signal).encode("ascii")
+        f.write(content)
 
 
 def compute_rms_envelope(signal: np.ndarray, window: int) -> np.ndarray:
@@ -366,6 +367,28 @@ def find_pulse_via_matched_filter(
     corr = np.correlate(signal, rep_norm, mode="full")
     peak_idx = int(np.argmax(corr)) - (len(replica) - 1)
     return max(0, min(peak_idx, len(signal) - p_len))
+
+
+def compute_matched_filter_peak(
+    signal: np.ndarray,
+    fs: float,
+    duration: float = 0.113,
+    f_start: float = 3200.0,
+    f_end: float = 5700.0,
+) -> Tuple[float, int, np.ndarray]:
+    """
+    Compute matched-filter cross-correlation peak magnitude, sample lag, and full correlation array.
+    """
+    p_len = int(round(duration * fs))
+    if len(signal) < p_len:
+        return 0.0, 0, np.array([], dtype=np.float32)
+    t = np.arange(p_len, dtype=np.float32) / fs
+    k = (f_end - f_start) / max(duration, 1e-6)
+    replica = (np.sin(2 * np.pi * (f_start * t + 0.5 * k * (t ** 2))) * np.hanning(p_len)).astype(np.float32)
+    rep_norm = replica / (np.sqrt(np.sum(replica ** 2)) + 1e-12)
+    corr = np.correlate(signal, rep_norm, mode="valid")
+    peak_idx = int(np.argmax(np.abs(corr)))
+    return float(np.abs(corr[peak_idx])), peak_idx, corr
 
 
 def apply_bandpass_filter(
