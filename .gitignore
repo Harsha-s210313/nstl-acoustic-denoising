@@ -1,6 +1,5 @@
 # Data and output directories
 data/
-models/
 inference_output/
 
 # Python cache and build artifacts
