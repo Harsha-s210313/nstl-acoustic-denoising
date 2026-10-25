@@ -162,10 +162,16 @@ def run_pipeline(
     clean_signal = None
 
     if is_trial:
-        ext_dict = extract_active_region(raw_signal, config, target_length=config.TRIAL_SIGNAL_LENGTH)
-        eval_signal = ext_dict["active"]
-        noise_ref = ext_dict["noise"]
-        active_bounds = (ext_dict["start"], ext_dict["end"])
+        if getattr(config, "INFERENCE_FULL_SEQUENCE", True):
+            eval_signal = raw_signal.copy()
+            w_ref = min(getattr(config, "TRIAL_NOISE_REF_WINDOW", 356), len(raw_signal))
+            noise_ref = extract_noise_reference(raw_signal, w_ref)
+            active_bounds = (0, len(raw_signal))
+        else:
+            ext_dict = extract_active_region(raw_signal, config, target_length=config.TRIAL_SIGNAL_LENGTH)
+            eval_signal = ext_dict["active"]
+            noise_ref = ext_dict["noise"]
+            active_bounds = (ext_dict["start"], ext_dict["end"])
     else:
         if len(raw_signal) != config.SIGNAL_LENGTH:
             eval_signal = load_dat_file(input_path, expected_length=config.SIGNAL_LENGTH)
@@ -219,6 +225,8 @@ def run_pipeline(
         fs_sig = config.TRIAL_SAMPLE_RATE if is_trial else config.SAMPLE_RATE
         if is_trial:
             denoised_signal = apply_bandpass_filter(denoised_signal, fs=fs_sig, lowcut=2500.0, highcut=6500.0)
+            if len(denoised_signal) >= 6:
+                denoised_signal[:6] = 0.0
         else:
             denoised_signal = apply_bandpass_filter(denoised_signal, fs=fs_sig, lowcut=15000.0, highcut=30000.0)
 
@@ -374,7 +382,12 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None, help="Explicit denoiser checkpoint path")
     parser.add_argument("--device", type=str, default=None, help="Device (cpu/cuda)")
     parser.add_argument("--show-plot", action="store_true", help="Open generated diagnostic plot in viewer")
+    parser.add_argument("--full-sequence", dest="full_sequence", action="store_true", default=True, help="Denoise full recording sequence without cropping (default: True)")
+    parser.add_argument("--crop", dest="full_sequence", action="store_false", help="Crop to active window before denoising")
     args = parser.parse_args()
+
+    cfg = Config()
+    cfg.INFERENCE_FULL_SEQUENCE = args.full_sequence
 
     run_pipeline(
         source=args.source,
@@ -383,6 +396,7 @@ def main():
         model_type=args.model,
         checkpoint=args.checkpoint,
         device=args.device,
+        cfg=cfg,
         show_plot=args.show_plot,
     )
 
