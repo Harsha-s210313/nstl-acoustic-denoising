@@ -169,8 +169,8 @@ def generate_physics_based_trial_recording(
     for d in multipath_delays:
         arr_idx = start_idx + d
         if arr_idx + pulse_len <= total_len:
-            decay = float(np.exp(-d / 3200.0))
-            refl_amp = amp * decay * float(r.uniform(0.25, 0.55)) * float(r.choice([-1.0, 1.0]))
+            decay = float(np.exp(-d / 2600.0))
+            refl_amp = amp * decay * float(r.uniform(0.18, 0.38)) * float(r.choice([-1.0, 1.0]))
             refl_phase = phase + float(r.uniform(0.0, 2.0 * np.pi))
             reverb[arr_idx : arr_idx + pulse_len] += (
                 refl_amp * np.sin(refl_phase) * np.hanning(pulse_len)
