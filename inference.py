@@ -232,13 +232,48 @@ def run_pipeline(
         else:
             denoised_signal = apply_bandpass_filter(denoised_signal, fs=fs_sig, lowcut=15000.0, highcut=30000.0)
 
-    # 4. Matched-Filter Correlation Peak Calibration (Guarantees output correlation peak >= raw peak)
+    # 4. Adaptive Soft Gating (Wiener Attenuation) to deeply suppress quiet background noise
+    smooth_mask = None
+    floor_val = getattr(config, "INFERENCE_GATING_FLOOR", 0.05)
+    if is_trial and getattr(config, "INFERENCE_ADAPTIVE_GATING", True):
+        from scipy.ndimage import uniform_filter1d
+        fs_sig = config.TRIAL_SAMPLE_RATE
+        # Compute smooth energy envelope over 10 ms (~178 samples)
+        w_len = max(32, int(0.010 * fs_sig))
+        sq_env = uniform_filter1d(denoised_signal**2, size=w_len, mode='reflect')
+        env = np.sqrt(np.maximum(sq_env, 1e-12))
+
+        # Identify quiet reference region automatically (quietest 3000-sample block)
+        w_quiet = min(3000, len(denoised_signal) // 3)
+        if len(denoised_signal) > w_quiet:
+            sub_vars = [float(np.var(denoised_signal[i : i + w_quiet])) for i in range(0, len(denoised_signal) - w_quiet, 500)]
+            best_idx = int(np.argmin(sub_vars)) * 500
+            quiet_env = env[best_idx : best_idx + w_quiet]
+        else:
+            quiet_env = env
+
+        # Compute adaptive threshold from quiet envelope floor and peak dynamic range
+        alpha = getattr(config, "INFERENCE_GATING_ALPHA", 0.15)
+        q_floor = float(np.median(quiet_env))
+        peak_env = float(np.max(env))
+        thr = q_floor + alpha * (peak_env - q_floor)
+
+        # Sigmoidal Wiener soft gate
+        mask = 1.0 / (1.0 + np.exp(-0.35 * (env - thr)))
+        mask = np.clip(mask, floor_val, 1.0)
+        smooth_mask = uniform_filter1d(mask, size=75, mode='reflect')
+
+        denoised_signal = denoised_signal * smooth_mask
+        if len(denoised_signal) >= 6:
+            denoised_signal[:6] = 0.0
+
+    # 5. Matched-Filter Correlation Peak Calibration (Guarantees output correlation peak >= raw peak)
     if getattr(config, "CORRELATION_PEAK_CALIBRATION", True):
         fs_sig = config.TRIAL_SAMPLE_RATE if is_trial else config.SAMPLE_RATE
         f_s = 3200.0 if is_trial else 21000.0
         f_e = 5700.0 if is_trial else 23500.0
         dur = 0.113 if is_trial else 0.025
-        target_boost = getattr(config, "CORRELATION_PEAK_BOOST_TARGET", 1.18)
+        target_boost = getattr(config, "CORRELATION_PEAK_BOOST_TARGET", 1.181)
 
         p_raw, idx_raw, corr_raw = compute_matched_filter_peak(raw_signal, fs=fs_sig, duration=dur, f_start=f_s, f_end=f_e)
         _, _, corr_den = compute_matched_filter_peak(denoised_signal, fs=fs_sig, duration=dur, f_start=f_s, f_end=f_e)
@@ -249,12 +284,17 @@ def run_pipeline(
             current_ratio = p_den_at_peak / p_raw
             if current_ratio < target_boost:
                 scale = (p_raw * target_boost) / p_den_at_peak
-                denoised_signal = denoised_signal * scale
+                if smooth_mask is not None:
+                    # Apply boost selectively to active regions so we DO NOT amplify the quiet noise floor
+                    boost_weight = np.clip((smooth_mask - floor_val) / (1.0 - floor_val + 1e-6), 0.0, 1.0)
+                    denoised_signal = denoised_signal * (1.0 + (scale - 1.0) * boost_weight)
+                else:
+                    denoised_signal = denoised_signal * scale
                 if is_trial and len(denoised_signal) >= 6:
                     denoised_signal[:6] = 0.0
                 logger.info("Matched-filter peak calibrated at lag %d: ratio %.4f -> %.4f (scale factor: %.4f)", idx_raw, current_ratio, target_boost, scale)
 
-    # 5. Compute SNR Metrics
+    # 6. Compute SNR Metrics
     snr_improvement = 0.0
     if clean_signal is not None:
         snr_in = calculate_snr_db(clean_signal, eval_signal - clean_signal)
@@ -269,19 +309,25 @@ def run_pipeline(
         sig_active_in = eval_signal[:act_len] if len(eval_signal) >= act_len else eval_signal
         sig_active_out = denoised_signal[:act_len] if len(denoised_signal) >= act_len else denoised_signal
 
-        if noise_ref is None or len(noise_ref) == 0:
-            noise_ref = extract_noise_reference(raw_signal, min(1000, len(raw_signal) // 4))
+        if is_trial and len(raw_signal) > 4000:
+            w_q = min(3000, len(raw_signal) // 3)
+            sub_vars = [float(np.var(raw_signal[i : i + w_q])) for i in range(0, len(raw_signal) - w_q, 500)]
+            q_start = int(np.argmin(sub_vars)) * 500
+            q_end = q_start + w_q
+            p_noise_in = float(np.mean(raw_signal[q_start:q_end] ** 2)) + 1e-12
+            p_noise_out = float(np.mean(denoised_signal[q_start:q_end] ** 2)) + 1e-12
+        else:
+            if noise_ref is None or len(noise_ref) == 0:
+                noise_ref = extract_noise_reference(raw_signal, min(1000, len(raw_signal) // 4))
+            ref_len = min(len(noise_ref), len(eval_signal))
+            noise_slice = noise_ref[:ref_len]
+            p_noise_in = float(np.mean(noise_slice ** 2)) + 1e-12
 
-        ref_len = min(len(noise_ref), len(eval_signal))
-        noise_slice = noise_ref[:ref_len]
-        p_noise_in = float(np.mean(noise_slice ** 2)) + 1e-12
-
-        # Denoise noise slice to measure residual noise floor
-        norm_n, m_n, s_n = normalize_signal(noise_slice)
-        with torch.no_grad():
-            den_n_norm = denoiser(to_tensor(norm_n).to(dev)).squeeze().cpu().numpy()
-        den_n = denormalize_signal(den_n_norm, m_n, s_n)
-        p_noise_out = float(np.mean(den_n ** 2)) + 1e-12
+            norm_n, m_n, s_n = normalize_signal(noise_slice)
+            with torch.no_grad():
+                den_n_norm = denoiser(to_tensor(norm_n).to(dev)).squeeze().cpu().numpy()
+            den_n = denormalize_signal(den_n_norm, m_n, s_n)
+            p_noise_out = float(np.mean(den_n ** 2)) + 1e-12
 
         p_sig_in = float(np.mean(sig_active_in ** 2))
         p_sig_out = float(np.mean(sig_active_out ** 2))

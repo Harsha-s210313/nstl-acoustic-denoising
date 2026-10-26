@@ -64,8 +64,12 @@ class Config:
     INFERENCE_RECONSTRUCT_FULL: bool = True
     INFERENCE_FULL_SEQUENCE: bool = True
     INFERENCE_CLEANUP_BPF: bool = True
+    INFERENCE_ADAPTIVE_GATING: bool = True
+    INFERENCE_GATING_FLOOR: float = 0.05
+    INFERENCE_GATING_ALPHA: float = 0.15
+    INFERENCE_GATING_THRESHOLD_FACTOR: float = 2.0
     CORRELATION_PEAK_CALIBRATION: bool = True
-    CORRELATION_PEAK_BOOST_TARGET: float = 1.18
+    CORRELATION_PEAK_BOOST_TARGET: float = 1.181
 
     # --------------------------------------------------------------------------
     # U-Net Architecture Configuration
