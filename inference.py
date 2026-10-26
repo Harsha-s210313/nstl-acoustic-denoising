@@ -372,12 +372,13 @@ def run_pipeline(
         json.dump(meta_info, f, indent=2)
     logger.info("Saved metadata sidecar to: %s", out_meta_path)
 
-    # 7. Generate Visual Diagnostic Plot (Lazy matplotlib import, Agg backend)
+    # 7. Generate Visual Diagnostic Plot using matplotlib.pyplot
     plot_path = None
-    if save_plot:
+    if save_plot or show_plot:
         try:
             import matplotlib
-            matplotlib.use("Agg")
+            if not show_plot:
+                matplotlib.use("Agg")
             import matplotlib.pyplot as plt
             from scipy.signal import welch
 
@@ -415,20 +416,18 @@ def run_pipeline(
             ax2.legend(loc="upper right")
 
             plt.tight_layout()
-            try:
-                plt.savefig(plot_path, dpi=150)
-            except OSError:
-                plot_path = os.path.join(config.INFERENCE_OUTPUT_DIR, f"{base_name}_analysis_latest.png")
-                plt.savefig(plot_path, dpi=150)
-            plt.close(fig)
-            logger.info("Saved diagnostic plot to: %s", plot_path)
+            if save_plot:
+                try:
+                    plt.savefig(plot_path, dpi=150)
+                except OSError:
+                    plot_path = os.path.join(config.INFERENCE_OUTPUT_DIR, f"{base_name}_analysis_latest.png")
+                    plt.savefig(plot_path, dpi=150)
+                logger.info("Saved diagnostic plot to: %s", plot_path)
 
-            if show_plot and plot_path and os.path.isfile(plot_path):
-                if sys.platform.startswith("win"):
-                    try:
-                        os.startfile(plot_path)
-                    except Exception as ex:
-                        logger.debug("Could not open plot in image viewer: %s", ex)
+            if show_plot:
+                plt.show()
+            else:
+                plt.close(fig)
         except Exception as e:
             logger.warning("Could not generate diagnostic plot: %s", e)
 

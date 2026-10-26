@@ -47,14 +47,6 @@ def run() -> None:
     print(f"  Diagnostic Plot:  {res['output_plot']}")
     print(f"  SNR Improvement:  {res['snr_improvement']:+.2f} dB")
 
-    # Ensure plot opens on Windows
-    if res.get("output_plot") and os.path.isfile(res["output_plot"]):
-        if sys.platform.startswith("win"):
-            try:
-                os.startfile(res["output_plot"])
-            except Exception:
-                pass
-
 
 if __name__ == "__main__":
     run()
