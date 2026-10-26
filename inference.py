@@ -71,7 +71,7 @@ def run_pipeline(
     device: Optional[str] = None,
     cfg: Optional[Config] = None,
     save_plot: bool = True,
-    show_plot: bool = False,
+    show_plot: bool = True,
 ) -> Dict[str, Any]:
     """
     Execute full detection + denoising inference pipeline.
@@ -414,7 +414,7 @@ def run_pipeline(
             ax2.set_ylabel("PSD (V^2 / Hz)")
             ax2.grid(True, linestyle=":", alpha=0.6)
             ax2.legend(loc="upper right")
-
+            plt.show()
             plt.tight_layout()
             if save_plot:
                 try:
@@ -424,10 +424,7 @@ def run_pipeline(
                     plt.savefig(plot_path, dpi=150)
                 logger.info("Saved diagnostic plot to: %s", plot_path)
 
-            if show_plot:
-                plt.show()
-            else:
-                plt.close(fig)
+            
         except Exception as e:
             logger.warning("Could not generate diagnostic plot: %s", e)
 

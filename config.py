@@ -58,9 +58,9 @@ class Config:
     UNET_FINETUNED_CHECKPOINT: str = "models/unet_finetuned_best.pth"
 
     INFERENCE_OUTPUT_DIR: str = "inference_output"
-    INFERENCE_DEFAULT_SOURCE: str = "trial"
+    INFERENCE_DEFAULT_SOURCE: str = r"C:\Users\HARSHA\Documents\pri\channel001.dat"
     INFERENCE_TRIAL_PRI: str = ""
-    INFERENCE_TRIAL_CHANNEL: str = "channel24.dat"
+    INFERENCE_TRIAL_CHANNEL: str = ""
     INFERENCE_RECONSTRUCT_FULL: bool = True
     INFERENCE_FULL_SEQUENCE: bool = True
     INFERENCE_CLEANUP_BPF: bool = True
