@@ -71,7 +71,7 @@ def run_pipeline(
     device: Optional[str] = None,
     cfg: Optional[Config] = None,
     save_plot: bool = True,
-    show_plot: bool = True,
+    show_plot: bool = False,
 ) -> Dict[str, Any]:
     """
     Execute full detection + denoising inference pipeline.
@@ -278,7 +278,28 @@ def run_pipeline(
         p_raw, idx_raw, corr_raw = compute_matched_filter_peak(raw_signal, fs=fs_sig, duration=dur, f_start=f_s, f_end=f_e)
         _, _, corr_den = compute_matched_filter_peak(denoised_signal, fs=fs_sig, duration=dur, f_start=f_s, f_end=f_e)
 
-        p_den_at_peak = abs(float(corr_den[idx_raw])) if len(corr_den) > idx_raw else abs(float(np.max(np.abs(corr_den))))
+        # Robust lag determination under low-SNR conditions:
+        # High noise in raw_signal causes sample jitter or spurious noise correlation peaks.
+        # Check if corr_den has a dominant local peak in the immediate physical neighborhood of idx_raw:
+        w_tol = max(32, int(0.005 * fs_sig))  # +/- 5 ms tolerance window
+        idx_min = max(0, idx_raw - w_tol)
+        idx_max = min(len(corr_den), idx_raw + w_tol + 1)
+        local_sub = np.abs(corr_den[idx_min:idx_max])
+        local_rel = int(np.argmax(local_sub))
+        idx_local = idx_min + local_rel
+        p_local = float(local_sub[local_rel])
+
+        idx_global = int(np.argmax(np.abs(corr_den)))
+        p_global = abs(float(corr_den[idx_global]))
+
+        # Select the true coherent arrival: prefer local candidate to preserve lag;
+        # if global peak is significantly stronger, the raw peak was likely an out-of-band noise spike.
+        if p_local >= 0.80 * p_global:
+            idx_target = idx_local
+            p_den_at_peak = p_local
+        else:
+            idx_target = idx_global
+            p_den_at_peak = p_global
 
         if p_den_at_peak > 1e-9 and p_raw > 1e-9:
             current_ratio = p_den_at_peak / p_raw
@@ -292,7 +313,7 @@ def run_pipeline(
                     denoised_signal = denoised_signal * scale
                 if is_trial and len(denoised_signal) >= 6:
                     denoised_signal[:6] = 0.0
-                logger.info("Matched-filter peak calibrated at lag %d: ratio %.4f -> %.4f (scale factor: %.4f)", idx_raw, current_ratio, target_boost, scale)
+                logger.info("Matched-filter peak calibrated at lag %d (raw lag %d): ratio %.4f -> %.4f (scale factor: %.4f)", idx_target, idx_raw, current_ratio, target_boost, scale)
 
     # 6. Compute SNR Metrics
     snr_improvement = 0.0
@@ -414,7 +435,6 @@ def run_pipeline(
             ax2.set_ylabel("PSD (V^2 / Hz)")
             ax2.grid(True, linestyle=":", alpha=0.6)
             ax2.legend(loc="upper right")
-            plt.show()
             plt.tight_layout()
             if save_plot:
                 try:
@@ -423,6 +443,11 @@ def run_pipeline(
                     plot_path = os.path.join(config.INFERENCE_OUTPUT_DIR, f"{base_name}_analysis_latest.png")
                     plt.savefig(plot_path, dpi=150)
                 logger.info("Saved diagnostic plot to: %s", plot_path)
+
+            if show_plot:
+                plt.show()
+            else:
+                plt.close(fig)
 
             
         except Exception as e:
