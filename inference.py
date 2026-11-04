@@ -260,21 +260,31 @@ def run_pipeline(
         from scipy.ndimage import uniform_filter1d
         fs_sig = config.TRIAL_SAMPLE_RATE
 
-        # Locate pulse onset using the guide's MATLAB replica correlation algorithm
-        mat_raw, bin_centers, p_bin_raw, p_sample_raw = lfm113ms_correlation(
-            raw_signal,
-            pulse_width=56e-3,
-            fs=fs_sig,
-            tgt_rel_vel=10,
-        )
+        # Multi-pulse width detection (113 ms vs 56 ms):
+        # NSTL ocean trial chirps can be 113 ms (e.g. PRI_01/pri_generated) or 56 ms.
+        # We correlate against both Doppler replicas and automatically select the true physical chirp duration.
+        out56, _, b56, p56 = lfm113ms_correlation(raw_signal, pulse_width=56e-3, fs=fs_sig, tgt_rel_vel=10)
+        out113, _, b113, p113 = lfm113ms_correlation(raw_signal, pulse_width=113e-3, fs=fs_sig, tgt_rel_vel=10)
+
+        if float(np.max(out113)) >= float(np.max(out56)):
+            best_pw = 113e-3
+            mat_raw = out113
+            p_bin_raw = b113
+            p_sample_raw = p113
+        else:
+            best_pw = 56e-3
+            mat_raw = out56
+            p_bin_raw = b56
+            p_sample_raw = p56
+
         papr_raw = float(mat_raw[p_bin_raw] / (np.median(mat_raw) + 1e-12))
         logger.info(
-            "LFM Replica Correlation on raw input: Peak at Bin %d (sample %d, power %.3e, PAPR %.2f)",
-            p_bin_raw + 1, p_sample_raw, mat_raw[p_bin_raw], papr_raw
+            "LFM Replica Correlation: Detected %d ms pulse at Bin %d (sample %d, power %.3e, PAPR %.2f)",
+            int(round(best_pw * 1000)), p_bin_raw + 1, p_sample_raw, mat_raw[p_bin_raw], papr_raw
         )
 
-        p_len = int(round(0.056 * fs_sig))    # ~1000 samples for 56 ms chirp
-        p_margin = int(round(0.015 * fs_sig)) # ~268 samples margin
+        p_len = int(round(best_pw * fs_sig))
+        p_margin = int(round(0.012 * fs_sig)) # ~214 samples smooth margin
 
         # If user explicitly enables reverberation tail preservation, track multipath decay:
         if getattr(config, "INFERENCE_PRESERVE_REVERB_TAIL", False):
@@ -297,11 +307,11 @@ def run_pipeline(
                 p_sample_raw, decay_idx, (decay_idx - p_sample_raw) / fs_sig * 1000.0, decay_idx - p_sample_raw
             )
         else:
-            # Clean direct-arrival 56 ms chirp (eliminates trailing multipath clutter and false echoes)
+            # Clean direct-arrival chirp (covers the FULL physical pulse without cutting signal)
             decay_idx = p_sample_raw + p_len
             logger.info(
-                "Direct LFM pulse span: sample %d to %d (56 ms chirp, trailing clutter suppressed)",
-                p_sample_raw, decay_idx
+                "Direct LFM pulse span: sample %d to %d (full %d ms chirp, 100%% signal preserved)",
+                p_sample_raw, decay_idx, int(round(best_pw * 1000))
             )
 
         # Build targeted protective gate centered on the coherent pulse arrival and full reverb tail
@@ -324,17 +334,18 @@ def run_pipeline(
 
         if is_trial:
             fs_sig = config.TRIAL_SAMPLE_RATE
+            corr_pw = best_pw if 'best_pw' in locals() else 56e-3
             if mat_raw is None:
                 mat_raw, _, p_bin_raw, p_sample_raw = lfm113ms_correlation(
                     raw_signal,
-                    pulse_width=56e-3,
+                    pulse_width=corr_pw,
                     fs=fs_sig,
                     tgt_rel_vel=10,
                 )
 
             mat_den, _, p_bin_den, _ = lfm113ms_correlation(
                 denoised_signal,
-                pulse_width=56e-3,
+                pulse_width=corr_pw,
                 fs=fs_sig,
                 tgt_rel_vel=10,
             )
@@ -358,7 +369,7 @@ def run_pipeline(
 
                     mat_cal, _, bin_cal, _ = lfm113ms_correlation(
                         denoised_signal,
-                        pulse_width=56e-3,
+                        pulse_width=corr_pw,
                         fs=fs_sig,
                         tgt_rel_vel=10,
                     )
