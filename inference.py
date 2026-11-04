@@ -276,10 +276,33 @@ def run_pipeline(
         p_len = int(round(0.056 * fs_sig))    # ~1000 samples for 56 ms chirp
         p_margin = int(round(0.015 * fs_sig)) # ~268 samples margin
 
-        # Build targeted protective gate centered on the coherent pulse arrival
+        # Dynamic reverberation tail tracking:
+        # In underwater acoustics, multipath reflections (surface/bottom) create an acoustic
+        # reverberation tail that extends beyond the 56 ms direct chirp.
+        # Track the envelope until it naturally decays back to the ambient ocean noise floor.
+        w_len = max(32, int(0.010 * fs_sig))
+        env = np.sqrt(np.maximum(uniform_filter1d(denoised_signal**2, size=w_len, mode='reflect'), 1e-12))
+        ref_zone_end = max(1000, p_sample_raw - p_margin)
+        bg_floor = float(np.median(env[:ref_zone_end])) if ref_zone_end > 0 else float(np.median(env))
+
+        decay_idx = p_sample_raw + p_len
+        search_limit = min(len(denoised_signal), p_sample_raw + int(round(0.250 * fs_sig)))
+        for idx in range(p_sample_raw + p_len, search_limit):
+            if env[idx] <= 1.5 * bg_floor:
+                decay_idx = idx
+                break
+        else:
+            decay_idx = search_limit
+
+        logger.info(
+            "Acoustic pulse + reverberation span: sample %d to %d (duration: %.1f ms, %d samples)",
+            p_sample_raw, decay_idx, (decay_idx - p_sample_raw) / fs_sig * 1000.0, decay_idx - p_sample_raw
+        )
+
+        # Build targeted protective gate centered on the coherent pulse arrival and full reverb tail
         gate_mask = np.full(len(denoised_signal), floor_val, dtype=np.float32)
         p_start = max(0, p_sample_raw - p_margin)
-        p_end = min(len(denoised_signal), p_sample_raw + p_len + p_margin)
+        p_end = min(len(denoised_signal), decay_idx + p_margin)
         gate_mask[p_start:p_end] = 1.0
 
         # Smooth transition to avoid spectral distortion or step transients
@@ -450,7 +473,7 @@ def run_pipeline(
 
             plot_path = os.path.join(config.INFERENCE_OUTPUT_DIR, f"{base_name}_analysis.png")
             if mat_raw is not None and mat_cal is not None:
-                fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(11, 9))
+                fig, ax1 = plt.subplots(1, 1)
             else:
                 fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(11, 7))
                 ax2 = None
@@ -470,31 +493,31 @@ def run_pipeline(
             ax1.legend(loc="upper right")
 
             # Subplot 2: LFM Replica Cross-Correlation (Lfm113ms.m)
-            if ax2 is not None and mat_raw is not None and mat_cal is not None:
-                bins_x = np.arange(1, len(mat_raw) + 1)
-                ax2.plot(bins_x, mat_raw, color="#90a4ae", linewidth=1.0, alpha=0.8, label=f"Raw Correlation (Peak: {mat_raw[p_bin_raw]:.2e} @ Bin {p_bin_raw+1})")
-                ax2.plot(bins_x, mat_cal, color="#d32f2f", linewidth=1.5, label=f"Denoised Output (+18.1% Boost: {mat_cal[p_bin_raw]:.2e} @ Bin {p_bin_raw+1})")
-                ax2.set_title(f"LFM Replica Cross-Correlation (Lfm113ms.m) | Coherent Peak @ Bin {p_bin_raw+1} (Zero Shift, Noise Suppressed)", fontsize=11, fontweight="bold")
-                ax2.set_xlabel("Range Bins (96 samples / bin)")
-                ax2.set_ylabel("Power (|IFFT|^2)")
-                ax2.grid(True, linestyle=":", alpha=0.6)
-                ax2.legend(loc="upper right")
-
-            # Subplot 3: Power Spectral Density (PSD)
+##            if ax2 is not None and mat_raw is not None and mat_cal is not None:
+##                bins_x = np.arange(1, len(mat_raw) + 1)
+##                ax2.plot(bins_x, mat_raw, color="#90a4ae", linewidth=1.0, alpha=0.8, label=f"Raw Correlation (Peak: {mat_raw[p_bin_raw]:.2e} @ Bin {p_bin_raw+1})")
+##                ax2.plot(bins_x, mat_cal, color="#d32f2f", linewidth=1.5, label=f"Denoised Output (+18.1% Boost: {mat_cal[p_bin_raw]:.2e} @ Bin {p_bin_raw+1})")
+##                ax2.set_title(f"LFM Replica Cross-Correlation (Lfm113ms.m) | Coherent Peak @ Bin {p_bin_raw+1} (Zero Shift, Noise Suppressed)", fontsize=11, fontweight="bold")
+##                ax2.set_xlabel("Range Bins (96 samples / bin)")
+##                ax2.set_ylabel("Power (|IFFT|^2)")
+##                ax2.grid(True, linestyle=":", alpha=0.6)
+##                ax2.legend(loc="upper right")
+##
+##            # Subplot 3: Power Spectral Density (PSD)
             nperseg = min(512, len(eval_signal))
             f_noisy, psd_noisy = welch(eval_signal, fs=fs, nperseg=nperseg)
             f_denoised, psd_denoised = welch(denoised_signal, fs=fs, nperseg=nperseg)
 
-            ax3.semilogy(f_noisy / 1000.0, psd_noisy, color="#b0bec5", label="Noisy PSD")
-            if clean_signal is not None:
-                f_clean, psd_clean = welch(clean_signal, fs=fs, nperseg=nperseg)
-                ax3.semilogy(f_clean / 1000.0, psd_clean, color="#2e7d32", linestyle="--", label="Clean PSD")
-            ax3.semilogy(f_denoised / 1000.0, psd_denoised, color="#1565c0", label="Denoised PSD")
-            ax3.set_title(f"Power Spectral Density (Welch) | Estimated SNR Gain: {snr_improvement:+.2f} dB", fontsize=11, fontweight="bold")
-            ax3.set_xlabel("Frequency (kHz)")
-            ax3.set_ylabel("PSD (V^2 / Hz)")
-            ax3.grid(True, linestyle=":", alpha=0.6)
-            ax3.legend(loc="upper right")
+##            ax3.semilogy(f_noisy / 1000.0, psd_noisy, color="#b0bec5", label="Noisy PSD")
+##            if clean_signal is not None:
+##                f_clean, psd_clean = welch(clean_signal, fs=fs, nperseg=nperseg)
+##                ax3.semilogy(f_clean / 1000.0, psd_clean, color="#2e7d32", linestyle="--", label="Clean PSD")
+##            ax3.semilogy(f_denoised / 1000.0, psd_denoised, color="#1565c0", label="Denoised PSD")
+##            ax3.set_title(f"Power Spectral Density (Welch) | Estimated SNR Gain: {snr_improvement:+.2f} dB", fontsize=11, fontweight="bold")
+##            ax3.set_xlabel("Frequency (kHz)")
+##            ax3.set_ylabel("PSD (V^2 / Hz)")
+##            ax3.grid(True, linestyle=":", alpha=0.6)
+##            ax3.legend(loc="upper right")
             plt.tight_layout()
             if save_plot:
                 try:
