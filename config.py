@@ -49,7 +49,7 @@ class Config:
     SYNTHETIC_CLEAN_SUBDIR: str = "synthetic/clean"
     SYNTHETIC_NOISY_SUBDIR: str = "synthetic/noisy"
 
-    TRIAL_DATA_DIR: str = r"C:\Users\HARSHA\Documents\pri_generated"
+    TRIAL_DATA_DIR: str = r"C:\Users\HARSHA\Downloads\TransferNow-202611045ka7yBlH"
     TRIAL_SIGNAL_SUBDIR: str = ""
     TRIAL_NOISE_SUBDIR: str = ""  # Optional, may not exist
 
@@ -58,9 +58,9 @@ class Config:
     UNET_FINETUNED_CHECKPOINT: str = "models/unet_finetuned_best.pth"
 
     INFERENCE_OUTPUT_DIR: str = "inference_output"
-    INFERENCE_DEFAULT_SOURCE: str = "trial"
+    INFERENCE_DEFAULT_SOURCE: str = r"C:\Users\HARSHA\Downloads\TransferNow-202611045ka7yBlH\channel0.dat"
     INFERENCE_TRIAL_PRI: str = ""
-    INFERENCE_TRIAL_CHANNEL: str = "channel24.dat"
+    INFERENCE_TRIAL_CHANNEL: str = "channel0.dat"
     INFERENCE_RECONSTRUCT_FULL: bool = True
     INFERENCE_FULL_SEQUENCE: bool = True
     INFERENCE_CLEANUP_BPF: bool = True

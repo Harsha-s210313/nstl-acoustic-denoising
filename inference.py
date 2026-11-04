@@ -69,7 +69,7 @@ def calculate_snr_db(signal: np.ndarray, noise: np.ndarray) -> float:
 
 
 def run_pipeline(
-    source: str = "synthetic",
+    source: Optional[str] = None,
     pri: Optional[str] = None,
     channel: Optional[str] = None,
     model_type: Optional[str] = None,
@@ -85,6 +85,10 @@ def run_pipeline(
     config = cfg or default_config
     config.validate()
 
+    source_val = source if source is not None else getattr(config, "INFERENCE_DEFAULT_SOURCE", "synthetic")
+    if not source_val:
+        source_val = "synthetic"
+
     dev_str = device or ("cuda" if torch.cuda.is_available() else "cpu")
     dev = torch.device(dev_str)
 
@@ -92,7 +96,7 @@ def run_pipeline(
     clean_path = None
     is_trial = False
 
-    if source.lower() == "synthetic":
+    if source_val.lower() == "synthetic":
         noisy_dir = os.path.join(config.SYNTHETIC_DATA_DIR, config.SYNTHETIC_NOISY_SUBDIR)
         if not os.path.isdir(noisy_dir):
             for alt in [
@@ -120,7 +124,7 @@ def run_pipeline(
         c_candidate = os.path.join(clean_dir, os.path.basename(input_path))
         if os.path.isfile(c_candidate):
             clean_path = c_candidate
-    elif source.lower() == "trial":
+    elif source_val.lower() == "trial":
         is_trial = True
         pri_val = pri if pri is not None else config.INFERENCE_TRIAL_PRI
         ch_val = channel or config.INFERENCE_TRIAL_CHANNEL
@@ -156,7 +160,7 @@ def run_pipeline(
                     raise FileNotFoundError(f"No trial data files found under {config.TRIAL_DATA_DIR}")
     else:
         # User supplied explicit path
-        input_path = source
+        input_path = source_val
         if not os.path.isfile(input_path):
             raise FileNotFoundError(f"File not found: {input_path}")
         raw_check = load_dat_file(input_path)
@@ -522,7 +526,7 @@ def run_pipeline(
 
 def main():
     parser = argparse.ArgumentParser(description="Acoustic Pipeline Denoising Inference")
-    parser.add_argument("--source", type=str, default="synthetic", help="Source: 'synthetic', 'trial', or direct file path")
+    parser.add_argument("--source", type=str, default=None, help="Source: 'synthetic', 'trial', direct file path, or None for config default")
     parser.add_argument("--pri", type=str, default=None, help="Trial PRI folder (e.g. 'PRI_01')")
     parser.add_argument("--channel", type=str, default=None, help="Trial channel file (e.g. 'channel001.dat')")
     parser.add_argument("--model", type=str, choices=["pretrained", "finetuned"], default=None, help="U-Net checkpoint stage")
