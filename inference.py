@@ -276,28 +276,33 @@ def run_pipeline(
         p_len = int(round(0.056 * fs_sig))    # ~1000 samples for 56 ms chirp
         p_margin = int(round(0.015 * fs_sig)) # ~268 samples margin
 
-        # Dynamic reverberation tail tracking:
-        # In underwater acoustics, multipath reflections (surface/bottom) create an acoustic
-        # reverberation tail that extends beyond the 56 ms direct chirp.
-        # Track the envelope until it naturally decays back to the ambient ocean noise floor.
-        w_len = max(32, int(0.010 * fs_sig))
-        env = np.sqrt(np.maximum(uniform_filter1d(denoised_signal**2, size=w_len, mode='reflect'), 1e-12))
-        ref_zone_end = max(1000, p_sample_raw - p_margin)
-        bg_floor = float(np.median(env[:ref_zone_end])) if ref_zone_end > 0 else float(np.median(env))
+        # If user explicitly enables reverberation tail preservation, track multipath decay:
+        if getattr(config, "INFERENCE_PRESERVE_REVERB_TAIL", False):
+            w_len = max(32, int(0.010 * fs_sig))
+            env = np.sqrt(np.maximum(uniform_filter1d(denoised_signal**2, size=w_len, mode='reflect'), 1e-12))
+            ref_zone_end = max(1000, p_sample_raw - p_margin)
+            bg_floor = float(np.median(env[:ref_zone_end])) if ref_zone_end > 0 else float(np.median(env))
 
-        decay_idx = p_sample_raw + p_len
-        search_limit = min(len(denoised_signal), p_sample_raw + int(round(0.250 * fs_sig)))
-        for idx in range(p_sample_raw + p_len, search_limit):
-            if env[idx] <= 1.5 * bg_floor:
-                decay_idx = idx
-                break
+            decay_idx = p_sample_raw + p_len
+            search_limit = min(len(denoised_signal), p_sample_raw + int(round(0.250 * fs_sig)))
+            for idx in range(p_sample_raw + p_len, search_limit):
+                if env[idx] <= 1.5 * bg_floor:
+                    decay_idx = idx
+                    break
+            else:
+                decay_idx = search_limit
+
+            logger.info(
+                "Acoustic pulse + reverberation span: sample %d to %d (duration: %.1f ms, %d samples)",
+                p_sample_raw, decay_idx, (decay_idx - p_sample_raw) / fs_sig * 1000.0, decay_idx - p_sample_raw
+            )
         else:
-            decay_idx = search_limit
-
-        logger.info(
-            "Acoustic pulse + reverberation span: sample %d to %d (duration: %.1f ms, %d samples)",
-            p_sample_raw, decay_idx, (decay_idx - p_sample_raw) / fs_sig * 1000.0, decay_idx - p_sample_raw
-        )
+            # Clean direct-arrival 56 ms chirp (eliminates trailing multipath clutter and false echoes)
+            decay_idx = p_sample_raw + p_len
+            logger.info(
+                "Direct LFM pulse span: sample %d to %d (56 ms chirp, trailing clutter suppressed)",
+                p_sample_raw, decay_idx
+            )
 
         # Build targeted protective gate centered on the coherent pulse arrival and full reverb tail
         gate_mask = np.full(len(denoised_signal), floor_val, dtype=np.float32)
