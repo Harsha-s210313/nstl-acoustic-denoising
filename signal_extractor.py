@@ -35,6 +35,7 @@ from utils import (
     compute_rms_envelope,
     estimate_noise_floor,
     detect_active_region,
+    detect_pulse_via_lfm_correlation,
 )
 logging.basicConfig(
     level=logging.INFO,
@@ -221,6 +222,15 @@ if __name__ == "__main__":
     start, end = detect_active_region(
         rms, noise_floor, THRESHOLD_FACTOR, PAD_SAMPLES, len(signal)
     )
+    # Check LFM replica correlation for low / negative SNR files
+    try:
+        p_onset, p_pow, p_papr = detect_pulse_via_lfm_correlation(signal, fs=SAMPLE_RATE)
+        if p_papr >= 2.5 and (not (start <= p_onset <= end) or (start == 0 and end == len(signal))):
+            log.info("Negative/Low SNR condition detected: LFM replica correlation localized pulse onset at sample %d (PAPR=%.2f)", p_onset, p_papr)
+            start = max(0, p_onset - PAD_SAMPLES)
+            end = min(len(signal) - 1, p_onset + int(0.056 * SAMPLE_RATE) + PAD_SAMPLES)
+    except Exception as e:
+        log.debug("LFM correlation fallback skipped: %s", e)
     log.info("Detected active region    : samples %d – %d  (%.1f – %.1f ms)",
              start, end,
              start / SAMPLE_RATE * 1000,

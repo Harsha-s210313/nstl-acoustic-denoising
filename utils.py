@@ -6,7 +6,7 @@ envelope detection, and tensor conversions.
 import os
 import random
 import logging
-from typing import Tuple, Dict, Any, Optional, Union
+from typing import Tuple, Dict, Any, Optional, Union, List
 import numpy as np
 import torch
 
@@ -239,7 +239,7 @@ def extract_active_region(
     sig_len = len(signal)
 
     # Determine parameter set (trial data is ~19.3k samples or sampled at 17.8 kHz)
-    is_trial = sig_len < 22000
+    is_trial = (sig_len < 22000) or (sig_len in range(15000, 35000) and sig_len != cfg.SIGNAL_LENGTH)
     rms_window = cfg.TRIAL_RMS_WINDOW if is_trial else cfg.EXTRACTION_RMS_WINDOW
     pad_samples = cfg.TRIAL_PAD_SAMPLES if is_trial else cfg.EXTRACTION_PAD_SAMPLES
     out_length = target_length or (cfg.TRIAL_SIGNAL_LENGTH if is_trial else cfg.SIGNAL_LENGTH)
@@ -278,14 +278,26 @@ def extract_active_region(
         max_len=out_length,
     )
 
-    # Low-SNR Fallback: if RMS envelope failed to exceed threshold (fell back to entire signal)
-    # and recording length exceeds target_length, locate pulse via matched-filter replica correlation
-    if (start == 0 and end == sig_len) and sig_len > out_length:
-        fs_sig = cfg.TRIAL_SAMPLE_RATE if is_trial else cfg.SAMPLE_RATE
-        f_s = 3200.0 if is_trial else 21000.0
-        f_e = 5700.0 if is_trial else 23500.0
-        dur = 0.113 if is_trial else 0.025
-        p_onset = find_pulse_via_matched_filter(signal, fs=fs_sig, duration=dur, f_start=f_s, f_end=f_e)
+    # Coherent LFM Replica localization for low / negative SNR conditions:
+    # Under negative SNR, RMS can trigger on ambient ocean noise bursts rather than the chirp.
+    # We verify / localize the true pulse onset using the guide's MATLAB replica correlation algorithm.
+    if is_trial and sig_len > out_length:
+        p_onset, p_pow, p_papr = detect_pulse_via_lfm_correlation(signal, fs=cfg.TRIAL_SAMPLE_RATE)
+        # If the replica correlation identifies a distinct peak (PAPR >= 2.5) and RMS either missed it
+        # or fell back to the whole signal:
+        if p_papr >= 2.5 and (not (start <= p_onset <= end) or (start == 0 and end == sig_len)):
+            logger.info(
+                "Negative/Low SNR detected (PAPR=%.2f): Overriding RMS bounds [%d, %d] "
+                "with LFM replica correlation onset at sample %d.",
+                p_papr, start, end, p_onset
+            )
+            start = max(0, p_onset - pad_samples)
+            end = min(sig_len, start + out_length)
+            if (end - start) < out_length and start > 0:
+                start = max(0, end - out_length)
+    elif (start == 0 and end == sig_len) and sig_len > out_length:
+        fs_sig = cfg.SAMPLE_RATE
+        p_onset = find_pulse_via_matched_filter(signal, fs=fs_sig, duration=0.025, f_start=21000.0, f_end=23500.0)
         logger.info("Low-SNR detected: matched-filter replica localized pulse onset at sample %d", p_onset)
         start = max(0, p_onset - pad_samples)
         end = min(sig_len, start + out_length)
@@ -344,6 +356,153 @@ def extract_noise_reference(signal: np.ndarray, window_len: int) -> np.ndarray:
     win_energy = cumsum[window_len:] - cumsum[:-window_len]
     min_idx = int(np.argmin(win_energy))
     return signal[min_idx: min_idx + window_len].astype(np.float32)
+
+
+def lfm_replica_ge(
+    pulse_width: float = 56e-3,
+    points: int = 2048,
+    tgt_rel_vel: Union[float, int, List[float], np.ndarray] = 10,
+    c: float = 1500.0,
+    f0_start: float = 21.0e3,
+    f1_end: float = 23.5e3,
+    fs: float = 1.0 / 56e-6,
+) -> np.ndarray:
+    """
+    Generate Doppler-adjusted analytical LFM replica array matching the MATLAB LfmReplicaGe implementation.
+
+    Parameters:
+        pulse_width: Pulse duration in seconds (e.g. 56e-3, 113e-3).
+        points: Total FFT block length (e.g. 2048).
+        tgt_rel_vel: Relative velocity or velocities (knots scale, default 10).
+        c: Velocity of sound in water (m/s, default 1500).
+        f0_start: LFM carrier start frequency (Hz, default 21.0 kHz).
+        f1_end: LFM carrier end frequency (Hz, default 23.5 kHz).
+        fs: Sampling frequency (Hz, default 1 / 56 us ~ 17857.14 Hz).
+
+    Returns:
+        replica: (points, n_replica) complex64 numpy array of analytical replicas.
+    """
+    vel = np.atleast_1d(tgt_rel_vel).astype(np.float64)
+    n_replica = len(vel)
+    replica = np.zeros((points, n_replica), dtype=np.complex64)
+
+    for i in range(n_replica):
+        alpha = float(vel[i] / c)
+        f0 = (1.0 + alpha) * f0_start - fs
+        f1 = (1.0 + alpha) * f1_end - fs
+        n_pts = int(np.floor(fs * pulse_width / (1.0 + alpha)))
+        n_pts = min(n_pts, points)
+        if n_pts <= 0:
+            continue
+        mu = (f1 - f0) * fs / float(n_pts)
+        t = np.arange(1, n_pts + 1, dtype=np.float64) / fs
+        phase = 2.0 * np.pi * (f0 * t + 0.5 * mu * t * t)
+        replica[:n_pts, i] = np.cos(phase) + 1j * np.sin(phase)
+
+    return replica
+
+
+def lfm113ms_correlation(
+    signal: np.ndarray,
+    pulse_width: float = 56e-3,
+    points: int = 2048,
+    lag: int = 96,
+    tgt_rel_vel: Union[float, int, List[float], np.ndarray] = 10,
+    c: float = 1500.0,
+    f0_start: float = 21.0e3,
+    f1_end: float = 23.5e3,
+    fs: float = 1.0 / 56e-6,
+) -> Tuple[np.ndarray, np.ndarray, int, int]:
+    """
+    Block-FFT cross-correlation algorithm faithful to MATLAB Lfm113ms.m.
+    Processes the raw recording in overlapping blocks and computes matched-filter power
+    binned into range bins of width `lag` samples.
+
+    Returns:
+        out_powers: 1D float32 array of peak squared powers across range bins.
+        bin_sample_indices: 1D int32 array of corresponding sample indices in signal.
+        peak_bin_idx: Index of bin with maximum power (0-indexed; MATLAB bin is peak_bin_idx + 1).
+        peak_sample_idx: Approximate sample index of the true coherent pulse arrival in signal.
+    """
+    signal = np.asarray(signal, dtype=np.float32).ravel()
+    n_smp = len(signal)
+    if n_smp < points:
+        pad_w = points - n_smp
+        signal = np.pad(signal, (0, pad_w), mode="constant")
+        n_smp = len(signal)
+
+    rep = lfm_replica_ge(
+        pulse_width=pulse_width,
+        points=points,
+        tgt_rel_vel=tgt_rel_vel,
+        c=c,
+        f0_start=f0_start,
+        f1_end=f1_end,
+        fs=fs,
+    )
+
+    range_bins = int(np.floor((points - 990) / lag))
+    if range_bins <= 0:
+        range_bins = 1
+    step = lag * (range_bins - 1)
+    if step <= 0:
+        step = points // 2
+
+    # Lfm113ms.m specifies nReplica = 1 using the first replica column (vel = 10)
+    c_rep_fft = np.conj(np.fft.fft(rep[:, 0], n=points))
+
+    out_list = []
+    bin_centers = []
+
+    for i in range(0, n_smp - points + 1, step):
+        x = signal[i : i + points]
+        y = np.fft.fft(x, n=points)
+        mul = y * c_rep_fft
+        # In MATLAB: iff = abs(ifft(mul) * points).^2
+        iff = np.abs(np.fft.ifft(mul) * points) ** 2
+        for k in range(range_bins):
+            first = k * lag
+            last = min(first + lag, points)
+            sub_iff = iff[first:last]
+            max_rel = int(np.argmax(sub_iff))
+            out_list.append(float(sub_iff[max_rel]))
+            bin_centers.append(int(i + first + max_rel))
+
+    out_arr = np.array(out_list, dtype=np.float32)
+    bin_arr = np.array(bin_centers, dtype=np.int32)
+    if len(out_arr) == 0:
+        return np.array([0.0], dtype=np.float32), np.array([0], dtype=np.int32), 0, 0
+
+    peak_bin = int(np.argmax(out_arr))
+    peak_sample = int(bin_arr[peak_bin])
+    return out_arr, bin_arr, peak_bin, peak_sample
+
+
+def detect_pulse_via_lfm_correlation(
+    signal: np.ndarray,
+    fs: float = 1.0 / 56e-6,
+    pulse_width: float = 56e-3,
+    tgt_rel_vel: Union[float, int] = 10,
+) -> Tuple[int, float, float]:
+    """
+    Locate pulse onset sample index and evaluate Peak-to-Average Power Ratio (PAPR)
+    using the MATLAB Lfm113ms matched-filter algorithm.
+
+    Returns:
+        peak_sample: Estimated onset sample index.
+        peak_power: Peak correlation power.
+        papr: Peak-to-Average Power Ratio (coherent contrast against noise floor).
+    """
+    out, bins, peak_bin, peak_sample = lfm113ms_correlation(
+        signal=signal,
+        pulse_width=pulse_width,
+        tgt_rel_vel=tgt_rel_vel,
+        fs=fs,
+    )
+    peak_pow = float(out[peak_bin]) if len(out) > 0 else 0.0
+    mean_pow = float(np.mean(out)) if len(out) > 0 else 1e-12
+    papr = peak_pow / (mean_pow + 1e-12)
+    return peak_sample, peak_pow, papr
 
 
 def find_pulse_via_matched_filter(

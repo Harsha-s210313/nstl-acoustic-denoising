@@ -21,6 +21,9 @@ try:
         extract_active_region,
         normalize_signal,
         denormalize_signal,
+        lfm_replica_ge,
+        lfm113ms_correlation,
+        detect_pulse_via_lfm_correlation,
         to_tensor,
     )
     from nstl_acoustic.unet import Configurable1DUNet
@@ -38,6 +41,9 @@ except ModuleNotFoundError:
         extract_active_region,
         normalize_signal,
         denormalize_signal,
+        lfm_replica_ge,
+        lfm113ms_correlation,
+        detect_pulse_via_lfm_correlation,
         to_tensor,
     )
     from unet import Configurable1DUNet
@@ -318,5 +324,61 @@ def test_correlation_zero_shift():
         c_den = np.correlate(denoised, replica, mode="full")
         shift_model = int(np.argmax(c_raw)) - int(np.argmax(c_den))
         assert shift_model == 0, f"Expected 0 shift with trained model, got {shift_model}"
+
+
+def test_lfm_replica_generation_and_correlation():
+    """
+    Verify MATLAB LfmReplicaGe translation:
+    - Returns complex analytic signal of shape (points, n_replica)
+    - Replicas have unit magnitude on active samples
+    - lfm113ms_correlation localizes injected LFM chirp with 0 bin error
+    """
+    points = 2048
+    pw = 56e-3
+    fs = 1.0 / 56e-6
+    rep = lfm_replica_ge(pulse_width=pw, points=points, tgt_rel_vel=[10, 20])
+    assert rep.shape == (points, 2)
+    assert np.iscomplexobj(rep)
+
+    # Active samples have unit magnitude
+    alpha = 10.0 / 1500.0
+    N = int(np.floor(fs * pw / (1.0 + alpha)))
+    mags = np.abs(rep[:N, 0])
+    assert np.allclose(mags, 1.0, atol=1e-5)
+    # Padded samples are 0
+    assert np.all(rep[N:, 0] == 0)
+
+
+def test_negative_snr_pulse_localization():
+    """
+    Verify that in negative SNR conditions where RMS detection fails due to high-energy
+    ambient noise bursts, the coherent LFM replica correlation accurately detects the pulse.
+    """
+    np.random.seed(42)
+    sig_len = 19299
+    fs = 1.0 / 56e-6
+    noise = np.random.normal(0.0, 5.0, size=sig_len).astype(np.float32)
+
+    # 1. Inject high-energy noise burst at sample 2000 (RMS will be high here)
+    noise[2000:2800] += np.random.normal(0.0, 45.0, size=800).astype(np.float32)
+
+    # 2. Inject weaker coherent LFM chirp at sample 8000
+    pw = 56e-3
+    rep = lfm_replica_ge(pulse_width=pw, points=2048, tgt_rel_vel=10, fs=fs)
+    N = int(np.floor(fs * pw / (1.0 + 10.0 / 1500.0)))
+    chirp = np.real(rep[:N, 0]) * 15.0  # amplitude 15.0 (much lower energy than noise burst)
+    signal = noise.copy()
+    signal[8000 : 8000 + N] += chirp
+
+    # Test RMS envelope detection: it will pick sample ~2000 due to higher power
+    rms = compute_rms_envelope(signal, window=178)
+    rms_peak = int(np.argmax(rms))
+    assert 2000 <= rms_peak <= 2800, f"Expected RMS peak inside noise burst, got {rms_peak}"
+
+    # Test LFM replica correlation: coherent gain correctly localizes sample ~8000
+    p_onset, p_pow, p_papr = detect_pulse_via_lfm_correlation(signal, fs=fs, pulse_width=pw, tgt_rel_vel=10)
+    assert abs(p_onset - 8000) <= 96, f"Expected LFM correlation onset near 8000, got {p_onset}"
+    assert p_papr > 3.0, f"Expected strong PAPR contrast, got {p_papr}"
+
 
 

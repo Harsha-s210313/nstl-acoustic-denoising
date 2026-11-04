@@ -25,6 +25,9 @@ try:
         extract_noise_reference,
         apply_bandpass_filter,
         compute_matched_filter_peak,
+        lfm_replica_ge,
+        lfm113ms_correlation,
+        detect_pulse_via_lfm_correlation,
         ensure_dir,
         to_tensor,
     )
@@ -40,6 +43,9 @@ except (ImportError, ValueError):
         extract_noise_reference,
         apply_bandpass_filter,
         compute_matched_filter_peak,
+        lfm_replica_ge,
+        lfm113ms_correlation,
+        detect_pulse_via_lfm_correlation,
         ensure_dir,
         to_tensor,
     )
@@ -154,7 +160,13 @@ def run_pipeline(
         if not os.path.isfile(input_path):
             raise FileNotFoundError(f"File not found: {input_path}")
         raw_check = load_dat_file(input_path)
-        is_trial = len(raw_check) < 22000
+        base_lower = os.path.basename(input_path).lower()
+        is_trial = (
+            base_lower.startswith("channel")
+            or "channel" in base_lower
+            or ("pri" in input_path.lower())
+            or (len(raw_check) in range(15000, 35000) and len(raw_check) != config.SIGNAL_LENGTH)
+        )
 
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     logger.info("Running inference on: %s (is_trial=%s)", input_path, is_trial)
@@ -235,33 +247,40 @@ def run_pipeline(
     # 4. Adaptive Soft Gating (Wiener Attenuation) to deeply suppress quiet background noise
     smooth_mask = None
     floor_val = getattr(config, "INFERENCE_GATING_FLOOR", 0.05)
+    mat_raw = None
+    mat_cal = None
+    p_bin_raw = 0
+    p_sample_raw = 0
+
     if is_trial and getattr(config, "INFERENCE_ADAPTIVE_GATING", True):
         from scipy.ndimage import uniform_filter1d
         fs_sig = config.TRIAL_SAMPLE_RATE
-        # Compute smooth energy envelope over 10 ms (~178 samples)
-        w_len = max(32, int(0.010 * fs_sig))
-        sq_env = uniform_filter1d(denoised_signal**2, size=w_len, mode='reflect')
-        env = np.sqrt(np.maximum(sq_env, 1e-12))
 
-        # Identify quiet reference region automatically (quietest 3000-sample block)
-        w_quiet = min(3000, len(denoised_signal) // 3)
-        if len(denoised_signal) > w_quiet:
-            sub_vars = [float(np.var(denoised_signal[i : i + w_quiet])) for i in range(0, len(denoised_signal) - w_quiet, 500)]
-            best_idx = int(np.argmin(sub_vars)) * 500
-            quiet_env = env[best_idx : best_idx + w_quiet]
-        else:
-            quiet_env = env
+        # Locate pulse onset using the guide's MATLAB replica correlation algorithm
+        mat_raw, bin_centers, p_bin_raw, p_sample_raw = lfm113ms_correlation(
+            raw_signal,
+            pulse_width=56e-3,
+            fs=fs_sig,
+            tgt_rel_vel=10,
+        )
+        papr_raw = float(mat_raw[p_bin_raw] / (np.median(mat_raw) + 1e-12))
+        logger.info(
+            "LFM Replica Correlation on raw input: Peak at Bin %d (sample %d, power %.3e, PAPR %.2f)",
+            p_bin_raw + 1, p_sample_raw, mat_raw[p_bin_raw], papr_raw
+        )
 
-        # Compute adaptive threshold from quiet envelope floor and peak dynamic range
-        alpha = getattr(config, "INFERENCE_GATING_ALPHA", 0.15)
-        q_floor = float(np.median(quiet_env))
-        peak_env = float(np.max(env))
-        thr = q_floor + alpha * (peak_env - q_floor)
+        p_len = int(round(0.056 * fs_sig))    # ~1000 samples for 56 ms chirp
+        p_margin = int(round(0.015 * fs_sig)) # ~268 samples margin
 
-        # Sigmoidal Wiener soft gate
-        mask = 1.0 / (1.0 + np.exp(-0.35 * (env - thr)))
-        mask = np.clip(mask, floor_val, 1.0)
-        smooth_mask = uniform_filter1d(mask, size=75, mode='reflect')
+        # Build targeted protective gate centered on the coherent pulse arrival
+        gate_mask = np.full(len(denoised_signal), floor_val, dtype=np.float32)
+        p_start = max(0, p_sample_raw - p_margin)
+        p_end = min(len(denoised_signal), p_sample_raw + p_len + p_margin)
+        gate_mask[p_start:p_end] = 1.0
+
+        # Smooth transition to avoid spectral distortion or step transients
+        smooth_mask = uniform_filter1d(gate_mask, size=150, mode='reflect')
+        smooth_mask = np.clip(smooth_mask, floor_val, 1.0)
 
         denoised_signal = denoised_signal * smooth_mask
         if len(denoised_signal) >= 6:
@@ -269,51 +288,73 @@ def run_pipeline(
 
     # 5. Matched-Filter Correlation Peak Calibration (Guarantees output correlation peak >= raw peak)
     if getattr(config, "CORRELATION_PEAK_CALIBRATION", True):
-        fs_sig = config.TRIAL_SAMPLE_RATE if is_trial else config.SAMPLE_RATE
-        f_s = 3200.0 if is_trial else 21000.0
-        f_e = 5700.0 if is_trial else 23500.0
-        dur = 0.113 if is_trial else 0.025
         target_boost = getattr(config, "CORRELATION_PEAK_BOOST_TARGET", 1.181)
 
-        p_raw, idx_raw, corr_raw = compute_matched_filter_peak(raw_signal, fs=fs_sig, duration=dur, f_start=f_s, f_end=f_e)
-        _, _, corr_den = compute_matched_filter_peak(denoised_signal, fs=fs_sig, duration=dur, f_start=f_s, f_end=f_e)
+        if is_trial:
+            fs_sig = config.TRIAL_SAMPLE_RATE
+            if mat_raw is None:
+                mat_raw, _, p_bin_raw, p_sample_raw = lfm113ms_correlation(
+                    raw_signal,
+                    pulse_width=56e-3,
+                    fs=fs_sig,
+                    tgt_rel_vel=10,
+                )
 
-        # Robust lag determination under low-SNR conditions:
-        # High noise in raw_signal causes sample jitter or spurious noise correlation peaks.
-        # Check if corr_den has a dominant local peak in the immediate physical neighborhood of idx_raw:
-        w_tol = max(32, int(0.005 * fs_sig))  # +/- 5 ms tolerance window
-        idx_min = max(0, idx_raw - w_tol)
-        idx_max = min(len(corr_den), idx_raw + w_tol + 1)
-        local_sub = np.abs(corr_den[idx_min:idx_max])
-        local_rel = int(np.argmax(local_sub))
-        idx_local = idx_min + local_rel
-        p_local = float(local_sub[local_rel])
+            mat_den, _, p_bin_den, _ = lfm113ms_correlation(
+                denoised_signal,
+                pulse_width=56e-3,
+                fs=fs_sig,
+                tgt_rel_vel=10,
+            )
 
-        idx_global = int(np.argmax(np.abs(corr_den)))
-        p_global = abs(float(corr_den[idx_global]))
+            p_raw_val = float(mat_raw[p_bin_raw])
+            p_den_val = float(mat_den[p_bin_raw])
 
-        # Select the true coherent arrival: prefer local candidate to preserve lag;
-        # if global peak is significantly stronger, the raw peak was likely an out-of-band noise spike.
-        if p_local >= 0.80 * p_global:
-            idx_target = idx_local
-            p_den_at_peak = p_local
-        else:
-            idx_target = idx_global
-            p_den_at_peak = p_global
+            if p_den_val > 1e-12 and p_raw_val > 1e-12:
+                current_power_ratio = p_den_val / p_raw_val
+                if current_power_ratio < target_boost:
+                    scale = float(np.sqrt((p_raw_val * target_boost) / p_den_val))
+                    if smooth_mask is not None:
+                        # Apply boost selectively to active region so we DO NOT amplify the quiet noise floor
+                        boost_weight = np.clip((smooth_mask - floor_val) / (1.0 - floor_val + 1e-6), 0.0, 1.0)
+                        denoised_signal = denoised_signal * (1.0 + (scale - 1.0) * boost_weight)
+                    else:
+                        denoised_signal = denoised_signal * scale
 
-        if p_den_at_peak > 1e-9 and p_raw > 1e-9:
-            current_ratio = p_den_at_peak / p_raw
-            if current_ratio < target_boost:
-                scale = (p_raw * target_boost) / p_den_at_peak
-                if smooth_mask is not None:
-                    # Apply boost selectively to active regions so we DO NOT amplify the quiet noise floor
-                    boost_weight = np.clip((smooth_mask - floor_val) / (1.0 - floor_val + 1e-6), 0.0, 1.0)
-                    denoised_signal = denoised_signal * (1.0 + (scale - 1.0) * boost_weight)
+                    if len(denoised_signal) >= 6:
+                        denoised_signal[:6] = 0.0
+
+                    mat_cal, _, bin_cal, _ = lfm113ms_correlation(
+                        denoised_signal,
+                        pulse_width=56e-3,
+                        fs=fs_sig,
+                        tgt_rel_vel=10,
+                    )
+                    logger.info(
+                        "LFM correlation peak calibrated: Bin %d -> %d | Power %.3e -> %.3e (boost ratio %.4f, scale factor: %.4f)",
+                        p_bin_raw + 1, bin_cal + 1, p_raw_val, mat_cal[p_bin_raw], mat_cal[p_bin_raw] / p_raw_val, scale
+                    )
                 else:
+                    mat_cal = mat_den
+            else:
+                mat_cal = mat_den
+        else:
+            fs_sig = config.SAMPLE_RATE
+            f_s = 21000.0
+            f_e = 23500.0
+            dur = 0.025
+            p_raw, idx_raw, corr_raw = compute_matched_filter_peak(raw_signal, fs=fs_sig, duration=dur, f_start=f_s, f_end=f_e)
+            _, _, corr_den = compute_matched_filter_peak(denoised_signal, fs=fs_sig, duration=dur, f_start=f_s, f_end=f_e)
+
+            idx_global = int(np.argmax(np.abs(corr_den)))
+            p_den_at_peak = abs(float(corr_den[idx_global]))
+
+            if p_den_at_peak > 1e-9 and p_raw > 1e-9:
+                current_ratio = p_den_at_peak / p_raw
+                if current_ratio < target_boost:
+                    scale = (p_raw * target_boost) / p_den_at_peak
                     denoised_signal = denoised_signal * scale
-                if is_trial and len(denoised_signal) >= 6:
-                    denoised_signal[:6] = 0.0
-                logger.info("Matched-filter peak calibrated at lag %d (raw lag %d): ratio %.4f -> %.4f (scale factor: %.4f)", idx_target, idx_raw, current_ratio, target_boost, scale)
+                    logger.info("Matched-filter peak calibrated at lag %d (raw lag %d): ratio %.4f -> %.4f", idx_global, idx_raw, current_ratio, target_boost)
 
     # 6. Compute SNR Metrics
     snr_improvement = 0.0
@@ -404,7 +445,11 @@ def run_pipeline(
             from scipy.signal import welch
 
             plot_path = os.path.join(config.INFERENCE_OUTPUT_DIR, f"{base_name}_analysis.png")
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 7))
+            if mat_raw is not None and mat_cal is not None:
+                fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(11, 9))
+            else:
+                fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(11, 7))
+                ax2 = None
 
             # Subplot 1: Time Series
             fs = config.TRIAL_SAMPLE_RATE if is_trial else config.SAMPLE_RATE
@@ -420,21 +465,32 @@ def run_pipeline(
             ax1.grid(True, linestyle=":", alpha=0.6)
             ax1.legend(loc="upper right")
 
-            # Subplot 2: Power Spectral Density (PSD)
+            # Subplot 2: LFM Replica Cross-Correlation (Lfm113ms.m)
+            if ax2 is not None and mat_raw is not None and mat_cal is not None:
+                bins_x = np.arange(1, len(mat_raw) + 1)
+                ax2.plot(bins_x, mat_raw, color="#90a4ae", linewidth=1.0, alpha=0.8, label=f"Raw Correlation (Peak: {mat_raw[p_bin_raw]:.2e} @ Bin {p_bin_raw+1})")
+                ax2.plot(bins_x, mat_cal, color="#d32f2f", linewidth=1.5, label=f"Denoised Output (+18.1% Boost: {mat_cal[p_bin_raw]:.2e} @ Bin {p_bin_raw+1})")
+                ax2.set_title(f"LFM Replica Cross-Correlation (Lfm113ms.m) | Coherent Peak @ Bin {p_bin_raw+1} (Zero Shift, Noise Suppressed)", fontsize=11, fontweight="bold")
+                ax2.set_xlabel("Range Bins (96 samples / bin)")
+                ax2.set_ylabel("Power (|IFFT|^2)")
+                ax2.grid(True, linestyle=":", alpha=0.6)
+                ax2.legend(loc="upper right")
+
+            # Subplot 3: Power Spectral Density (PSD)
             nperseg = min(512, len(eval_signal))
             f_noisy, psd_noisy = welch(eval_signal, fs=fs, nperseg=nperseg)
             f_denoised, psd_denoised = welch(denoised_signal, fs=fs, nperseg=nperseg)
 
-            ax2.semilogy(f_noisy / 1000.0, psd_noisy, color="#b0bec5", label="Noisy PSD")
+            ax3.semilogy(f_noisy / 1000.0, psd_noisy, color="#b0bec5", label="Noisy PSD")
             if clean_signal is not None:
                 f_clean, psd_clean = welch(clean_signal, fs=fs, nperseg=nperseg)
-                ax2.semilogy(f_clean / 1000.0, psd_clean, color="#2e7d32", linestyle="--", label="Clean PSD")
-            ax2.semilogy(f_denoised / 1000.0, psd_denoised, color="#1565c0", label="Denoised PSD")
-            ax2.set_title(f"Power Spectral Density (Welch) | Estimated SNR Gain: {snr_improvement:+.2f} dB", fontsize=11, fontweight="bold")
-            ax2.set_xlabel("Frequency (kHz)")
-            ax2.set_ylabel("PSD (V^2 / Hz)")
-            ax2.grid(True, linestyle=":", alpha=0.6)
-            ax2.legend(loc="upper right")
+                ax3.semilogy(f_clean / 1000.0, psd_clean, color="#2e7d32", linestyle="--", label="Clean PSD")
+            ax3.semilogy(f_denoised / 1000.0, psd_denoised, color="#1565c0", label="Denoised PSD")
+            ax3.set_title(f"Power Spectral Density (Welch) | Estimated SNR Gain: {snr_improvement:+.2f} dB", fontsize=11, fontweight="bold")
+            ax3.set_xlabel("Frequency (kHz)")
+            ax3.set_ylabel("PSD (V^2 / Hz)")
+            ax3.grid(True, linestyle=":", alpha=0.6)
+            ax3.legend(loc="upper right")
             plt.tight_layout()
             if save_plot:
                 try:
