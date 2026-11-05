@@ -33,13 +33,13 @@ class Config:
     NOISE_REF_WINDOW: int = 2000
 
     # --------------------------------------------------------------------------
-    # Trial Data Parameters (17.8 kHz bandpass-sampled)
+    # Trial Data Parameters (17.857 kHz hardware bandpass-sampled, 56us period)
     # --------------------------------------------------------------------------
-    TRIAL_SAMPLE_RATE: float = 17_800.0  # Hz
+    TRIAL_SAMPLE_RATE: float = 1.0 / 56e-06  # Exact 17857.14 Hz, matching MATLAB Lfm113ms.m
     TRIAL_SIGNAL_LENGTH: int = 5000  # Model input length for trial stage
-    TRIAL_RMS_WINDOW: int = 178  # 10 ms at 17.8 kHz
-    TRIAL_PAD_SAMPLES: int = 890  # 50 ms at 17.8 kHz
-    TRIAL_NOISE_REF_WINDOW: int = 356  # 20 ms at 17.8 kHz
+    TRIAL_RMS_WINDOW: int = 179  # 10 ms at 17.857 kHz
+    TRIAL_PAD_SAMPLES: int = 893  # 50 ms at 17.857 kHz
+    TRIAL_NOISE_REF_WINDOW: int = 357  # 20 ms at 17.857 kHz
     TRIAL_IS_COMPLEX: bool = False
 
     # --------------------------------------------------------------------------
@@ -58,7 +58,7 @@ class Config:
     UNET_FINETUNED_CHECKPOINT: str = "models/unet_finetuned_best.pth"
 
     INFERENCE_OUTPUT_DIR: str = "inference_output"
-    INFERENCE_DEFAULT_SOURCE: str = r"C:\Users\HARSHA\Downloads\TransferNow-202611045ka7yBlH\channel0.dat"
+    INFERENCE_DEFAULT_SOURCE: str = r"C:\Users\HARSHA\Documents\pri_generated\channel3.dat"
     INFERENCE_TRIAL_PRI: str = ""
     INFERENCE_TRIAL_CHANNEL: str = "channel0.dat"
     INFERENCE_RECONSTRUCT_FULL: bool = True
