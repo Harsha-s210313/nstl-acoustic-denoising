@@ -217,10 +217,22 @@ def run_pipeline(
             unet_ckpt_path = config.UNET_PRETRAINED_CHECKPOINT
 
     if not os.path.isfile(unet_ckpt_path):
-        raise FileNotFoundError(
-            f"Denoiser checkpoint not found at: {unet_ckpt_path}. "
-            "Please train or pretrain the model first."
-        )
+        # Try resolving relative to the script directory or project root
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        cand1 = os.path.join(script_dir, unet_ckpt_path)
+        cand2 = os.path.join(script_dir, os.path.basename(unet_ckpt_path))
+        cand3 = os.path.join(script_dir, "models", os.path.basename(unet_ckpt_path))
+        if os.path.isfile(cand1):
+            unet_ckpt_path = cand1
+        elif os.path.isfile(cand2):
+            unet_ckpt_path = cand2
+        elif os.path.isfile(cand3):
+            unet_ckpt_path = cand3
+        else:
+            raise FileNotFoundError(
+                f"Denoiser checkpoint not found at: {unet_ckpt_path}. "
+                "Please train or pretrain the model first."
+            )
 
     logger.info("Loading U-Net denoiser weights from %s", unet_ckpt_path)
     denoiser = Configurable1DUNet(cfg=config).to(dev)

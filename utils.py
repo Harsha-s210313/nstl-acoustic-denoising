@@ -402,6 +402,28 @@ def lfm_replica_ge(
     return replica
 
 
+def precompute_lfm_replica_fft(
+    pulse_width: float = 56e-3,
+    points: int = 2048,
+    tgt_rel_vel: Union[float, int] = 10,
+    c: float = 1500.0,
+    f0_start: float = 21.0e3,
+    f1_end: float = 23.5e3,
+    fs: float = 1.0 / 56e-6,
+) -> np.ndarray:
+    """Precompute and return the conjugated FFT of the analytical LFM replica."""
+    rep = lfm_replica_ge(
+        pulse_width=pulse_width,
+        points=points,
+        tgt_rel_vel=tgt_rel_vel,
+        c=c,
+        f0_start=f0_start,
+        f1_end=f1_end,
+        fs=fs,
+    )
+    return np.conj(np.fft.fft(rep[:, 0], n=points))
+
+
 def lfm113ms_correlation(
     signal: np.ndarray,
     pulse_width: float = 56e-3,
@@ -412,6 +434,7 @@ def lfm113ms_correlation(
     f0_start: float = 21.0e3,
     f1_end: float = 23.5e3,
     fs: float = 1.0 / 56e-6,
+    c_rep_fft: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, int, int]:
     """
     Block-FFT cross-correlation algorithm faithful to MATLAB Lfm113ms.m.
@@ -431,16 +454,6 @@ def lfm113ms_correlation(
         signal = np.pad(signal, (0, pad_w), mode="constant")
         n_smp = len(signal)
 
-    rep = lfm_replica_ge(
-        pulse_width=pulse_width,
-        points=points,
-        tgt_rel_vel=tgt_rel_vel,
-        c=c,
-        f0_start=f0_start,
-        f1_end=f1_end,
-        fs=fs,
-    )
-
     range_bins = int(np.floor((points - 990) / lag))
     if range_bins <= 0:
         range_bins = 1
@@ -448,8 +461,17 @@ def lfm113ms_correlation(
     if step <= 0:
         step = points // 2
 
-    # Lfm113ms.m specifies nReplica = 1 using the first replica column (vel = 10)
-    c_rep_fft = np.conj(np.fft.fft(rep[:, 0], n=points))
+    if c_rep_fft is None:
+        rep = lfm_replica_ge(
+            pulse_width=pulse_width,
+            points=points,
+            tgt_rel_vel=tgt_rel_vel,
+            c=c,
+            f0_start=f0_start,
+            f1_end=f1_end,
+            fs=fs,
+        )
+        c_rep_fft = np.conj(np.fft.fft(rep[:, 0], n=points))
 
     out_list = []
     bin_centers = []
